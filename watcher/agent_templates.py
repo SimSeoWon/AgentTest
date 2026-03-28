@@ -574,6 +574,54 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
     },
 }
 
+# 프로젝트 레벨 settings.json에 등록할 MCP 서버 목록
+MCP_SERVERS: dict[str, str] = {
+    "context-search":    "./.claude/mcp/context_search.exe",
+    "log-analyzer":      "./.claude/mcp/log_analyzer.exe",
+    "crash-analyzer":    "./.claude/mcp/crash_analyzer.exe",
+    "commandlet-runner": "./.claude/mcp/commandlet_runner.exe",
+}
+
+# CLAUDE.md 에 삽입/갱신하는 AgentWatch 관리 구역
+# <!-- AgentWatch:Start --> ~ <!-- AgentWatch:End --> 사이 내용을 항상 최신으로 유지한다.
+AGENTWATCH_MD_MARKER_START = "<!-- AgentWatch:Start -->"
+AGENTWATCH_MD_MARKER_END   = "<!-- AgentWatch:End -->"
+
+PROJECT_CLAUDE_MD_SECTION = """\
+<!-- AgentWatch:Start -->
+## AgentWatch — 자동화 컨텍스트 시스템
+
+Git 커밋 감지 → RAG 컨텍스트 자동 갱신 → 다중 에이전트 분석이 자동으로 동작합니다.
+
+### 컨텍스트 파일 위치 및 형식
+- `.claude/context/<도메인>/` — 변경 소스 파일을 Claude가 요약한 MD 파일
+- 프론트매터 스키마:
+  ```yaml
+  ---
+  tags: [태그1, 태그2]
+  category: 대분류/중분류
+  related_classes:
+    - ClassName: path/to/file.ext
+  ---
+  ```
+- 코드 분석 시 이 파일들을 컨텍스트로 먼저 로드하세요.
+
+### 리뷰 리포트 위치
+- `.claude/reviews/YYYY-MM-DD_HHMM_<커밋해시>.md` — 커밋별 코드 리뷰
+- `.claude/reviews/YYYY-MM-DD_HHMM_<커밋해시>_assets.md` — 에셋 검증 결과
+
+### 에이전트 목록
+`.claude/agents/SKILL_INDEX.md` 참고
+
+### 등록된 MCP 서버
+| 서버 | 실행 파일 | 주요 툴 |
+|------|-----------|---------|
+| `context-search` | `.claude/mcp/context_search.exe` | `search_context`, `list_tags` |
+| `log-analyzer` | `.claude/mcp/log_analyzer.exe` | `analyze_log`, `search_log` |
+| `crash-analyzer` | `.claude/mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` |
+| `commandlet-runner` | `.claude/mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` |
+<!-- AgentWatch:End -->"""
+
 # 기본 컨텍스트 도메인 폴더 목록
 DEFAULT_CONTEXT_DOMAINS = [
     "AI",

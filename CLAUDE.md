@@ -108,19 +108,27 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 - Unreal 표준 구조(`Source/.git`)를 1순위로 탐색
 - 탐지 실패 시 오류 메시지 출력 후 종료
 
-**초기화 및 머지 (`init_project_dirs` + `_merge_agents`)**
+**초기화 및 머지 (`init_project_dirs` + `_merge_agents` + `_update_project_settings` + `_update_project_claude_md`)**
 
 최초 실행과 재실행 모두 동일한 함수가 실행되며, 머지 방식으로 동작한다:
 
 | 대상 | 최초 실행 | 재실행 (이미 존재) |
 |------|----------|-----------------|
-| `.claude/settings.json` | 생성 | 보존 (사용자 설정 유지) |
+| `.claude/settings.json` mcpServers | 등록 | 누락된 서버만 추가, 기존 항목 보존 |
+| `CLAUDE.md` (프로젝트 루트) | 생성 | AgentWatch 마커 구역만 갱신, 기존 내용 보존 |
+| `.claude/CLAUDE.md` | 건드리지 않음 | 존재 시 마커 구역 갱신 (팀 규칙 파일 대응) |
 | `context/` 도메인 폴더 | 생성 | 없는 폴더만 추가 |
 | `reviews/` 폴더 | 생성 | 유지 |
 | 에이전트 폴더 | 생성 | 없는 폴더만 추가 |
 | `role.md` / `prompt.md` / `settings.json` | 생성 | 보존 (커스텀 보호) |
 | `SKILL_INDEX.md` | 생성 | **항상 덮어쓰기** (인덱스 최신 유지) |
 | `config.json` | 생성 (auto_review 포함) | 보존 |
+
+**기존 Claude 환경 대응 (`_update_project_settings` + `_update_project_claude_md`)**
+- 이미 `.claude/settings.json`이 있어도 `mcpServers` 키를 머지하여 MCP 4종이 항상 등록됨
+- 이미 `CLAUDE.md`가 있어도 `<!-- AgentWatch:Start -->` ~ `<!-- AgentWatch:End -->` 마커 구역을 삽입/갱신
+  - 마커가 없으면 파일 끝에 추가, 있으면 해당 구역만 최신 내용으로 교체
+  - 마커 외부(사용자 작성 내용)는 절대 건드리지 않음
 
 **감시 루프**
 - `git fetch` → remote 해시와 local 해시 비교

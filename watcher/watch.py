@@ -1,3 +1,4 @@
+import re
 import sys
 import json
 import time
@@ -7,7 +8,9 @@ from datetime import datetime
 
 from agent_templates import (
     AGENTS, ROLE_TEMPLATES, PROMPT_TEMPLATES,
-    SKILL_INDEX, DEFAULT_CONTEXT_DOMAINS, SETTINGS_TEMPLATES
+    SKILL_INDEX, DEFAULT_CONTEXT_DOMAINS, SETTINGS_TEMPLATES,
+    MCP_SERVERS, PROJECT_CLAUDE_MD_SECTION,
+    AGENTWATCH_MD_MARKER_START, AGENTWATCH_MD_MARKER_END,
 )
 
 CONFIG_FILE = "config.json"
@@ -101,14 +104,6 @@ def init_project_dirs(base_dir: Path) -> tuple[Path, Path, Path]:
     is_new = not claude_dir.exists()
     claude_dir.mkdir(exist_ok=True)
 
-    # settings.json — 최초 1회만 생성 (사용자 설정 보존)
-    settings_path = claude_dir / "settings.json"
-    if not settings_path.exists():
-        settings_path.write_text(
-            json.dumps({"enabled": True}, ensure_ascii=False, indent=2),
-            encoding='utf-8'
-        )
-
     # context/ — 항상 실행: 새 도메인 폴더가 추가돼도 반영
     context_dir = claude_dir / "context"
     context_dir.mkdir(exist_ok=True)
@@ -123,6 +118,10 @@ def init_project_dirs(base_dir: Path) -> tuple[Path, Path, Path]:
     agents_dir = claude_dir / "agents"
     agents_dir.mkdir(exist_ok=True)
     added = _merge_agents(agents_dir)
+
+    # MCP 서버 및 CLAUDE.md — 항상 머지 (기존 Claude 환경 대응)
+    _update_project_settings(claude_dir)
+    _update_project_claude_md(base_dir)
 
     if is_new:
         log(".claude/ 구조 초기화 완료")
@@ -172,6 +171,86 @@ def _merge_agents(agents_dir: Path) -> list[str]:
     (agents_dir / "SKILL_INDEX.md").write_text(SKILL_INDEX, encoding='utf-8')
 
     return added
+
+
+def _update_project_settings(claude_dir: Path):
+    """
+    .claude/settings.json에 MCP 서버를 머지한다.
+    - 이미 등록된 서버는 보존 (사용자 커스텀 유지)
+    - 누락된 서버만 추가
+    - 항상 실행 (기존 파일 여부 무관)
+    """
+    settings_path = claude_dir / "settings.json"
+    settings: dict = {}
+
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding='utf-8'))
+        except Exception:
+            settings = {}
+
+    mcp = settings.setdefault("mcpServers", {})
+    added = []
+    for name, exe in MCP_SERVERS.items():
+        if name not in mcp:
+            mcp[name] = {"command": exe, "args": []}
+            added.append(name)
+
+    settings_path.write_text(
+        json.dumps(settings, ensure_ascii=False, indent=2),
+        encoding='utf-8'
+    )
+
+    if added:
+        log(f"settings.json MCP 등록 추가: {', '.join(added)}")
+
+
+def _merge_claude_md_section(md_path: Path):
+    """
+    지정한 CLAUDE.md 파일에 AgentWatch 관리 구역을 삽입/갱신한다.
+    - 마커 구역 있으면 최신 내용으로 교체
+    - 없으면 파일 끝에 추가
+    - 파일 자체가 없으면 새로 생성
+    """
+    if md_path.exists():
+        content = md_path.read_text(encoding='utf-8')
+        if AGENTWATCH_MD_MARKER_START in content:
+            content = re.sub(
+                re.escape(AGENTWATCH_MD_MARKER_START)
+                + r".*?"
+                + re.escape(AGENTWATCH_MD_MARKER_END),
+                PROJECT_CLAUDE_MD_SECTION,
+                content,
+                flags=re.DOTALL,
+            )
+            return content, "갱신"
+        else:
+            content = content.rstrip() + "\n\n" + PROJECT_CLAUDE_MD_SECTION + "\n"
+            return content, "추가"
+    else:
+        return PROJECT_CLAUDE_MD_SECTION + "\n", "생성"
+
+
+def _update_project_claude_md(base_dir: Path):
+    """
+    CLAUDE.md에 AgentWatch 관리 구역을 삽입/갱신한다.
+    대상:
+      1. 프로젝트 루트 CLAUDE.md (항상)
+      2. .claude/CLAUDE.md (존재하는 경우에만 — 팀이 여기서 규칙을 관리하는 경우 대응)
+    항상 실행 (기존 파일 여부 무관)
+    """
+    # 1. 루트 CLAUDE.md
+    root_md = base_dir / "CLAUDE.md"
+    content, action = _merge_claude_md_section(root_md)
+    root_md.write_text(content, encoding='utf-8')
+    log(f"CLAUDE.md AgentWatch 구역 {action}")
+
+    # 2. .claude/CLAUDE.md (있을 때만)
+    dot_claude_md = base_dir / ".claude" / "CLAUDE.md"
+    if dot_claude_md.exists():
+        content, action = _merge_claude_md_section(dot_claude_md)
+        dot_claude_md.write_text(content, encoding='utf-8')
+        log(f".claude/CLAUDE.md AgentWatch 구역 {action}")
 
 
 # ─────────────────────────────────────────
