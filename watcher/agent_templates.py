@@ -507,6 +507,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "allowedTools": ["Read", "Grep"],
         "scope": "repo",
         "mcpServers": {
+            "context-search": {
+                "command": "./.claude/mcp/context_search.exe",
+                "args": []
+            },
             "gemini-query": {
                 "command": "./.claude/mcp/gemini_query.exe",
                 "args": []
@@ -525,6 +529,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "allowedTools": ["Read", "Grep", "Glob"],
         "scope": "repo",
         "mcpServers": {
+            "context-search": {
+                "command": "./.claude/mcp/context_search.exe",
+                "args": []
+            },
             "gemini-query": {
                 "command": "./.claude/mcp/gemini_query.exe",
                 "args": []

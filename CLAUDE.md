@@ -181,7 +181,7 @@ claude -p "[프롬프트]" --dangerously-skip-permissions
 
 | 서버 | 빌드 산출물 | 제공 툴 | 사용 에이전트 |
 |------|------------|---------|-------------|
-| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 07 |
+| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 03, 05, 07, 08, 09, 10 |
 | `log_analyzer` | `mcp/log_analyzer.exe` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |

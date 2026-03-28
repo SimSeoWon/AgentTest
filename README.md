@@ -171,7 +171,7 @@ dist/
 
 | 서버 | 주요 툴 | 사용 에이전트 |
 |------|---------|-------------|
-| `context_search` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 07 |
+| `context_search` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 03, 05, 07, 08, 09, 10 |
 | `log_analyzer` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |
