@@ -1,0 +1,9 @@
+# 빌드 산출물
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
