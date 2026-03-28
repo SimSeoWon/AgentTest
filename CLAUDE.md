@@ -32,9 +32,11 @@ AgentTest/                         ← 이 저장소
 │   │   └── server.py              ← 태그 기반 컨텍스트 검색 MCP
 │   ├── log_analyzer/
 │   │   └── server.py              ← UE5 로그 파일 분석 MCP
-│   └── crash_analyzer/
-│       └── server.py              ← UE5 크래시 덤프/로그 분석 MCP
-├── build.bat                      ← 전체 빌드 스크립트 (watch.exe + MCP 3종)
+│   ├── crash_analyzer/
+│   │   └── server.py              ← UE5 크래시 덤프/로그 분석 MCP
+│   └── commandlet_runner/
+│       └── server.py              ← UE5 커맨드렛 실행 MCP (DataValidation 등)
+├── build.bat                      ← 전체 빌드 스크립트 (watch.exe + MCP 4종)
 └── CLAUDE.md
 ```
 
@@ -64,8 +66,9 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 │   ├── mcp/                       ← MCP 실행 파일
 │   │   ├── context_search.exe
 │   │   ├── log_analyzer.exe
-│   │   └── crash_analyzer.exe
-│   ├── reviews/                   ← 커밋별 코드 리뷰 리포트 (YYYY-MM-DD_HHMM_<hash>.md)
+│   │   ├── crash_analyzer.exe
+│   │   └── commandlet_runner.exe
+│   ├── reviews/                   ← 커밋별 코드 리뷰 / 에셋 검증 리포트
 │   ├── context/                   ← 변경된 소스 파일 → Claude가 생성한 MD
 │   │   ├── AI/
 │   │   ├── UI/
@@ -87,7 +90,8 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 │       ├── 06_빌드_통합/
 │       ├── 07_코드매니저/
 │       ├── 08_로그분석/
-│       └── 09_크래시분석/
+│       ├── 09_크래시분석/
+│       └── 10_에셋검증/
 ├── config.json                    ← 브랜치명, 폴링 간격 저장 (최초 실행 시 생성)
 ├── .watch_state                   ← 마지막 확인 커밋 해시 (멱등성 보장)
 └── watch.exe
@@ -120,10 +124,12 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 
 **감시 루프**
 - `git fetch` → remote 해시와 local 해시 비교
-- 변경 감지 시: `git pull` → `git diff --name-only` → 아래 두 작업 순차 실행
+- 변경 감지 시: `git pull` → `git diff --name-only` → 아래 세 작업 순차 실행
   1. **컨텍스트 갱신** (`update_context`) — `01_소스분석` 프롬프트로 MD 생성 → `context/`
   2. **코드 리뷰** (`run_code_review`) — `auto_review: true` 시에만 실행 → `reviews/`
-- 대상 확장자: `.cpp`, `.h`, `.hpp`, `.inl`, `.cs`, `.py`
+  3. **에셋 검증** (`run_asset_validation`) — `auto_asset_validation: true` 시에만 실행 → `reviews/`
+- 소스 대상 확장자: `.cpp`, `.h`, `.hpp`, `.inl`, `.cs`, `.py`
+- 에셋 대상 확장자: `.uasset`, `.umap`
 - `.watch_state` 파일로 마지막 커밋 해시 영속 저장 (멱등성 보장)
 
 **코드 리뷰 흐름 (`run_code_review`)**
@@ -131,6 +137,13 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 - 전체 취합: `07_코드매니저` 프롬프트로 통합 리포트 생성
 - 저장: `.claude/reviews/YYYY-MM-DD_HHMM_<커밋해시>.md`
 - `config.json`의 `auto_review: false` 로 비활성화 가능
+
+**에셋 검증 흐름 (`run_asset_validation`)**
+- `.uasset` / `.umap` 파일이 변경 목록에 있을 때만 실행
+- `.uproject`의 `EngineAssociation` → 레지스트리(`winreg`) → `%ProgramFiles%/Epic Games` 순으로 `UnrealEditor-Cmd.exe` 탐색
+- `UnrealEditor-Cmd.exe <uproject> -run=DataValidation -log -unattended -nullrhi` 실행
+- 커맨드렛 출력을 Claude CLI로 분석 → `reviews/YYYY-MM-DD_HHMM_<커밋해시>_assets.md` 저장
+- `config.json`의 `auto_asset_validation: false` 로 비활성화 가능
 
 **Claude CLI 호출 방식**
 ```
@@ -144,32 +157,35 @@ claude -p "[프롬프트]" --dangerously-skip-permissions
 
 | 상수 | 내용 |
 |------|------|
-| `AGENTS` | 에이전트 폴더명 목록 (01~09) |
+| `AGENTS` | 에이전트 폴더명 목록 (01~10) |
 | `ROLE_TEMPLATES` | 각 에이전트의 `role.md` 내용 |
 | `PROMPT_TEMPLATES` | 각 에이전트의 `prompt.md` 내용 |
 | `SETTINGS_TEMPLATES` | 각 에이전트의 `settings.json` 내용 (allowedTools, mcpServers) |
 | `SKILL_INDEX` | `SKILL_INDEX.md` 내용 |
 | `DEFAULT_CONTEXT_DOMAINS` | `context/` 하위 도메인 폴더 목록 |
 
-### 3. `mcp/` — MCP 서버 3종
+### 3. `mcp/` — MCP 서버 4종
 
 | 서버 | 빌드 산출물 | 제공 툴 | 사용 에이전트 |
 |------|------------|---------|-------------|
 | `context_search` | `mcp/context_search.exe` | `search_context`, `list_tags` | 02, 07 |
 | `log_analyzer` | `mcp/log_analyzer.exe` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` | 09 |
+| `commandlet_runner` | `mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |
 
 - `crash_analyzer`는 `cdb.exe`(Windows SDK) 유무를 자동 감지하여 `.dmp` 직접 분석 또는 XML/로그 폴백
-- 모든 MCP는 `./mcp/<name>.exe` 경로로 각 에이전트의 `settings.json`에 등록됨
+- `commandlet_runner`는 `.uproject`의 `EngineAssociation` → `winreg` → `%ProgramFiles%` 순으로 엔진 탐색
+- 모든 MCP는 `./.claude/mcp/<name>.exe` 경로로 각 에이전트의 `settings.json`에 등록됨
 
 ### 4. `build.bat`
 
-총 4단계 빌드:
+총 5단계 빌드:
 ```
-[1/4] watch.exe        ← --paths "watcher" 로 agent_templates.py 인식
-[2/4] context_search.exe
-[3/4] log_analyzer.exe
-[4/4] crash_analyzer.exe  → 모두 dist/mcp/ 에 출력
+[1/5] watch.exe              ← --paths "watcher" 로 agent_templates.py 인식
+[2/5] context_search.exe
+[3/5] log_analyzer.exe
+[4/5] crash_analyzer.exe
+[5/5] commandlet_runner.exe  → 모두 dist/.claude/mcp/ 에 출력
 ```
 
 ---
@@ -221,7 +237,7 @@ related_classes:
 ## 개발 환경 및 규칙
 
 - 플랫폼: Windows 11, 기본 셸은 `bash` (Git Bash / WSL)
-- 에이전트 추가 시: `agent_templates.py`의 `AGENTS`, `ROLE_TEMPLATES`, `PROMPT_TEMPLATES`, `SETTINGS_TEMPLATES`에 동시 추가
+- 에이전트 추가 시: `agent_templates.py`의 `AGENTS`, `ROLE_TEMPLATES`, `PROMPT_TEMPLATES`, `SETTINGS_TEMPLATES`, `SKILL_INDEX`에 동시 추가
 - MCP 추가 시: `mcp/<name>/server.py` 생성 → `build.bat`에 빌드 라인 추가 → 관련 에이전트 `SETTINGS_TEMPLATES`에 등록
 - 컨텍스트 도메인 추가 시: `agent_templates.py`의 `DEFAULT_CONTEXT_DOMAINS` 리스트에 추가
 - 소스 수정 후 반드시 `build.bat` 재실행하여 `dist/` 갱신

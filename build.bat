@@ -8,7 +8,7 @@ echo ===================================
 pip install pyinstaller mcp >nul 2>&1
 
 echo.
-echo [1/4] Building watch.exe ...
+echo [1/5] Building watch.exe ...
 pyinstaller -y ^
     --onefile ^
     --name "watch" ^
@@ -16,7 +16,7 @@ pyinstaller -y ^
     watcher/watch.py
 
 echo.
-echo [2/4] Building MCP - context_search ...
+echo [2/5] Building MCP - context_search ...
 if not exist "dist\.claude\mcp" mkdir dist\.claude\mcp
 
 pyinstaller -y ^
@@ -26,7 +26,7 @@ pyinstaller -y ^
     mcp/context_search/server.py
 
 echo.
-echo [3/4] Building MCP - log_analyzer ...
+echo [3/5] Building MCP - log_analyzer ...
 pyinstaller -y ^
     --onefile ^
     --distpath "dist\.claude\mcp" ^
@@ -34,12 +34,20 @@ pyinstaller -y ^
     mcp/log_analyzer/server.py
 
 echo.
-echo [4/4] Building MCP - crash_analyzer ...
+echo [4/5] Building MCP - crash_analyzer ...
 pyinstaller -y ^
     --onefile ^
     --distpath "dist\.claude\mcp" ^
     --name "crash_analyzer" ^
     mcp/crash_analyzer/server.py
+
+echo.
+echo [5/5] Building MCP - commandlet_runner ...
+pyinstaller -y ^
+    --onefile ^
+    --distpath "dist\.claude\mcp" ^
+    --name "commandlet_runner" ^
+    mcp/commandlet_runner/server.py
 
 echo.
 echo Packaging AgentWatch.zip ...

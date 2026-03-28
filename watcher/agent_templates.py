@@ -11,6 +11,7 @@ AGENTS = [
     "07_코드매니저",
     "08_로그분석",
     "09_크래시분석",
+    "10_에셋검증",
 ]
 
 # 각 에이전트의 role.md 템플릿
@@ -166,6 +167,27 @@ UE5 크래시 데이터(CrashContext.runtime-xml, .dmp, 크래시 로그)를 분
 
 ## 출력 형식
 크래시 요약 + 콜스택 분석 + 원인 추정 + 수정 제안 (Markdown)
+""",
+
+    "10_에셋검증": """\
+# 역할: 에셋 검증 에이전트
+
+## 목적
+UE5 DataValidation 커맨드렛 실행 결과를 분석하여
+변경된 에셋(.uasset / .umap)의 유효성 문제를 보고한다.
+
+## 책임
+- DataValidation 커맨드렛 출력에서 에러·경고 항목 추출
+- 에셋별 문제 분류 및 심각도 판단
+- 수정이 필요한 에셋과 원인 정리
+- 관련 코드 컨텍스트와 연결하여 원인 추정
+
+## 입력
+- DataValidation 커맨드렛 실행 결과 (stdout / stderr)
+- 변경된 에셋 파일 목록
+
+## 출력 형식
+검증 요약 + 에러 목록 + 경고 목록 + 수정 필요 항목 (Markdown)
 """,
 }
 
@@ -356,6 +378,37 @@ related_classes:
 ```
 """,
 
+    "10_에셋검증": """\
+# 에셋 검증 프롬프트 템플릿
+
+```
+당신은 Unreal Engine 5 에셋 검증 전문가입니다.
+아래 DataValidation 커맨드렛 실행 결과를 분석하고 문제를 보고하세요.
+
+[변경된 에셋 목록]
+{asset_list}
+
+[커맨드렛 실행 결과]
+{commandlet_output}
+
+[관련 코드 컨텍스트]
+{context}
+
+출력 형식:
+## 검증 요약
+(전체 통과/실패 여부, 에러/경고 건수)
+
+## 에러 목록 (에셋별)
+(에셋 경로 + 에러 내용 + 원인 추정)
+
+## 경고 목록
+(에셋 경로 + 경고 내용)
+
+## 수정 필요 항목
+(우선순위별 수정 방향)
+```
+""",
+
     "07_코드매니저": """\
 # 코드 매니저 (오케스트레이터) 프롬프트 템플릿
 
@@ -400,11 +453,14 @@ SKILL_INDEX = """\
 | 6 | 07_코드매니저 | 전체 통합 리포트 생성 | 위 결과 전체 | 최종 리뷰 리포트 |
 | - | 08_로그분석 | UE5 로그 에러·경고 분석 | .log 파일 경로 | 에러 요약 + 권장 조치 |
 | - | 09_크래시분석 | 크래시 원인 분석 | 크래시 폴더 / .dmp / .log | 크래시 요약 + 수정 제안 |
+| - | 10_에셋검증 | DataValidation 커맨드렛 결과 분석 | 커맨드렛 출력 + 에셋 목록 | 에셋 검증 리포트 |
 
 ## 실행 방법
 - **자동**: watch.py가 새 커밋 감지 시 01_소스분석 자동 실행
+- **자동 (에셋)**: .uasset / .umap 변경 감지 시 DataValidation 자동 실행
 - **수동 (로그)**: 08_로그분석에 .log 파일 경로 전달
 - **수동 (크래시)**: 09_크래시분석에 크래시 폴더 또는 파일 경로 전달
+- **수동 (에셋)**: 10_에셋검증에 에셋 검증 요청
 - **전체 리뷰**: 07_코드매니저를 호출하여 전체 파이프라인 실행
 """
 
@@ -492,6 +548,22 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "mcpServers": {
             "crash-analyzer": {
                 "command": "./.claude/mcp/crash_analyzer.exe",
+                "args": []
+            },
+            "context-search": {
+                "command": "./.claude/mcp/context_search.exe",
+                "args": []
+            }
+        },
+    },
+
+    "10_에셋검증": {
+        "description": "UE5 DataValidation 커맨드렛 결과를 분석하여 에셋 유효성 문제를 보고한다.",
+        "allowedTools": ["Read"],
+        "scope": "project",
+        "mcpServers": {
+            "commandlet-runner": {
+                "command": "./.claude/mcp/commandlet_runner.exe",
                 "args": []
             },
             "context-search": {

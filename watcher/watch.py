@@ -13,6 +13,7 @@ from agent_templates import (
 CONFIG_FILE = "config.json"
 STATE_FILE = ".watch_state"
 TARGET_EXTENSIONS = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}
+ASSET_EXTENSIONS = {'.uasset', '.umap'}
 
 
 def get_base_dir() -> Path:
@@ -73,10 +74,14 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     auto_review_raw = input("변경 감지 시 코드 리뷰 자동 실행 (기본값: y) [y/n]: ").strip().lower()
     auto_review = auto_review_raw != 'n'
 
+    auto_asset_raw = input("에셋 변경 시 커맨드렛 검증 자동 실행 (기본값: y) [y/n]: ").strip().lower()
+    auto_asset_validation = auto_asset_raw != 'n'
+
     config = {
         "branch": branch,
         "poll_interval": poll_interval,
         "auto_review": auto_review,
+        "auto_asset_validation": auto_asset_validation,
         "repo_dir": str(repo_dir),
     }
 
@@ -367,6 +372,129 @@ def _call_claude(prompt: str) -> str | None:
 
 
 # ─────────────────────────────────────────
+# 에셋 검증 (커맨드렛)
+# ─────────────────────────────────────────
+
+def _find_uproject(base_dir: Path) -> Path | None:
+    for p in base_dir.glob("*.uproject"):
+        return p
+    return None
+
+
+def _find_unreal_editor(base_dir: Path) -> tuple[str | None, str | None]:
+    """(editor_path, uproject_path) 반환. 탐색 실패 시 None."""
+    uproject = _find_uproject(base_dir)
+    if not uproject:
+        return None, None
+
+    try:
+        with open(uproject, encoding='utf-8') as f:
+            version = json.load(f).get("EngineAssociation", "")
+    except Exception:
+        return None, str(uproject)
+
+    # 1. 레지스트리 탐색
+    editor = None
+    try:
+        import winreg
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for arch in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_32KEY):
+                try:
+                    key = winreg.OpenKey(
+                        hive,
+                        f"SOFTWARE\\EpicGames\\Unreal Engine\\{version}",
+                        access=arch
+                    )
+                    install_dir, _ = winreg.QueryValueEx(key, "InstalledDirectory")
+                    for exe in ("UnrealEditor-Cmd.exe", "UE4Editor-Cmd.exe"):
+                        candidate = Path(install_dir) / "Engine" / "Binaries" / "Win64" / exe
+                        if candidate.exists():
+                            editor = str(candidate)
+                            break
+                except Exception:
+                    continue
+            if editor:
+                break
+    except ImportError:
+        pass
+
+    # 2. 환경변수 탐색
+    if not editor:
+        import os
+        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
+        for ue_dir in Path(pf, "Epic Games").glob(f"UE_{version}*"):
+            for exe in ("UnrealEditor-Cmd.exe", "UE4Editor-Cmd.exe"):
+                candidate = ue_dir / "Engine" / "Binaries" / "Win64" / exe
+                if candidate.exists():
+                    editor = str(candidate)
+                    break
+
+    return editor, str(uproject)
+
+
+def run_asset_validation(
+    base_dir: Path,
+    reviews_dir: Path,
+    changed_files: list[str],
+    commit_hash: str,
+):
+    """변경된 .uasset / .umap 파일에 대해 DataValidation 커맨드렛을 실행한다."""
+    assets = [f for f in changed_files if Path(f).suffix in ASSET_EXTENSIONS]
+    if not assets:
+        return
+
+    log(f"에셋 검증 시작 — {len(assets)}개 파일")
+
+    editor, uproject = _find_unreal_editor(base_dir)
+    if not editor:
+        log("[경고] UnrealEditor-Cmd.exe를 찾을 수 없어 에셋 검증을 건너뜁니다.")
+        return
+
+    try:
+        result = subprocess.run(
+            [editor, uproject,
+             "-run=DataValidation", "-log", "-unattended", "-nullrhi"],
+            capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=300
+        )
+        raw_output = result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        log("[경고] 커맨드렛 타임아웃 (300초) — 에셋 검증 중단")
+        return
+    except Exception as e:
+        log(f"[오류] 커맨드렛 실행 실패: {e}")
+        return
+
+    log("에셋 검증 결과 분석 중...")
+    prompt = (
+        f"아래는 UE5 DataValidation 커맨드렛 실행 결과입니다.\n"
+        f"변경된 에셋 목록:\n" +
+        "\n".join(f"  - {a}" for a in assets) +
+        f"\n\n커맨드렛 출력 (마지막 6000자):\n```\n{raw_output[-6000:]}\n```\n\n"
+        f"다음 형식으로 분석해줘:\n"
+        f"## 검증 요약\n"
+        f"## 에러 목록 (에셋별)\n"
+        f"## 경고 목록\n"
+        f"## 수정 필요 항목"
+    )
+
+    analysis = _call_claude(prompt)
+
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+    report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}_assets.md"
+    report_path.write_text(
+        f"# 에셋 검증 리포트\n\n"
+        f"커밋: `{commit_hash}`  \n"
+        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"## 검증 대상 에셋\n" +
+        "\n".join(f"- `{a}`" for a in assets) +
+        f"\n\n{analysis or '(분석 결과 없음)'}",
+        encoding='utf-8'
+    )
+    log(f"에셋 검증 완료 → {report_path.relative_to(base_dir)}")
+
+
+# ─────────────────────────────────────────
 # 상태 저장
 # ─────────────────────────────────────────
 
@@ -406,10 +534,15 @@ def main():
     branch = config["branch"]
     poll_interval = config["poll_interval"]
     auto_review = config.get("auto_review", True)
+    auto_asset_validation = config.get("auto_asset_validation", True)
 
     context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
-    log(f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | 자동 리뷰: {'ON' if auto_review else 'OFF'}")
+    log(
+        f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | "
+        f"자동 리뷰: {'ON' if auto_review else 'OFF'} | "
+        f"에셋 검증: {'ON' if auto_asset_validation else 'OFF'}"
+    )
     log(f"컨텍스트: {context_dir}")
     log(f"리뷰 저장: {reviews_dir}")
     print()
@@ -439,6 +572,9 @@ def main():
 
                         if auto_review:
                             run_code_review(repo_dir, context_dir, reviews_dir, changed_files, remote_hash)
+
+                        if auto_asset_validation:
+                            run_asset_validation(base_dir, reviews_dir, changed_files, remote_hash)
 
                         last_hash = remote_hash
                         save_state(base_dir, last_hash)
