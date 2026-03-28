@@ -1,7 +1,19 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(python:*)",
+      "Bash(where python:*)",
+      "Bash(\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/watcher/watch.py', encoding='utf-8'\\).read\\(\\)\\); print\\('watch.py: OK'\\)\")",
+      "Bash(\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/mcp/context_search/server.py', encoding='utf-8'\\).read\\(\\)\\); print\\('server.py: OK'\\)\" && \"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/watcher/agent_templates.py', encoding='utf-8'\\).read\\(\\)\\); print\\('agent_templates.py: OK'\\)\")",
+      "Bash(\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/watcher/watch.py', encoding='utf-8'\\).read\\(\\)\\); print\\('watch.py: OK'\\)\" && \"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/mcp/context_search/server.py', encoding='utf-8'\\).read\\(\\)\\); print\\('server.py: OK'\\)\")",
+      "Bash(\"C:/Users/USER/Documents/AgentTest/dist/.claude/mcp/context_search.exe\" --status \"C:/Users/USER/Documents/AgentTest/dist\")",
+      "Bash(\"C:/Users/USER/Documents/AgentTest/dist/.claude/mcp/context_search.exe\" --rebuild \"C:/Users/USER/Documents/AgentTest/dist\")",
+      "Bash(\"C:/Users/USER/Documents/ModularStage/.claude/mcp/context_search.exe\" --status \"C:/Users/USER/Documents/ModularStage\")",
+      "Bash(cd:*)",
+      "Bash(\"C:/Users/USER/Documents/ModularStage/.claude/mcp/context_search.exe\" --rebuild \"C:/Users/USER/Documents/ModularStage\")",
+      "Bash(\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/mcp/context_search/server.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(\"C:\\\\Users\\\\USER\\\\AppData\\\\Local\\\\Programs\\\\Python\\\\Python312\\\\python.exe\" -c \"import ast; ast.parse\\(open\\('C:/Users/USER/Documents/AgentTest/watcher/watch.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }

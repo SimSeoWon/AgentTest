@@ -11,6 +11,7 @@ Unreal Engine 5 프로젝트 팀을 위한 **Git 변경 감지 → RAG 컨텍스
 
 ```
 Git 변경 감지 → git pull → 소스 분석 → .claude/context/ MD 자동 갱신
+                                      → 벡터 인덱싱 → .claude/vector_db/ 갱신
                                       → 코드 리뷰 → .claude/reviews/ 저장
                                       → 에셋 검증 → .claude/reviews/ 저장
 ```
@@ -27,7 +28,7 @@ AgentTest/
 │   ├── watch.py                # 메인 워처 (PyInstaller 진입점)
 │   └── agent_templates.py      # 에이전트·MCP 템플릿 상수
 ├── mcp/
-│   ├── context_search/         # 태그 기반 컨텍스트 검색 MCP
+│   ├── context_search/         # 태그 + 벡터 통합 컨텍스트 검색 MCP
 │   ├── log_analyzer/           # UE5 로그 분석 MCP
 │   ├── crash_analyzer/         # UE5 크래시 분석 MCP
 │   ├── commandlet_runner/      # UE5 커맨드렛 실행 MCP
@@ -107,6 +108,7 @@ dist/
 └── .claude/
     ├── settings.json        ← MCP 5종 자동 등록 (기존 설정 머지)
     ├── mcp/                 ← MCP 실행 파일
+    ├── vector_db/           ← ChromaDB 벡터 인덱스 (자동 생성)
     ├── context/             ← 10개 UE5 도메인 폴더
     ├── reviews/             ← 코드 리뷰 · 에셋 검증 리포트
     └── agents/              ← 10개 에이전트 폴더
@@ -137,11 +139,39 @@ dist/
 
 ---
 
+## RAG 검색 시스템
+
+컨텍스트 MD 파일을 **벡터 유사도**(ChromaDB + `all-MiniLM-L6-v2`)와 **태그 키워드** 두 가지 방식으로 검색한다.
+
+### 통합 검색 (`combined_search`)
+
+에이전트는 **항상 `combined_search`를 우선 사용**한다. 이 툴은 내부적으로:
+
+1. 벡터 검색(의미 기반) 수행
+2. 벡터 결과에서 태그를 자동 추출 + 사용자 지정 태그 병합
+3. 태그 검색(키워드 기반) 수행
+4. 두 결과를 병합·중복 제거하여 반환
+
+### 한국어 검색 정확도 주의사항
+
+> **`all-MiniLM-L6-v2` 임베딩 모델은 영어 중심으로 학습되어, 한국어 자연어 쿼리의 의미 검색 정확도가 낮다.**
+>
+> - 순수 한국어 쿼리 → 유사도 0.4대, 관련 없는 문서가 상위에 노출될 수 있음
+> - 영어 / C++ 클래스명 포함 쿼리 → 유사도 0.5~0.6, 정확도 양호
+>
+> **권장 사용법:**
+> - 검색 시 **클래스명·함수명 등 코드 식별자를 함께 포함**하면 정확도가 크게 향상됨
+>   - 예: `"UMissionTask_Spawn 스포너 컴포넌트 연결"` → 정확한 결과
+>   - 예: `"몬스터 스폰 태스크"` (한국어만) → 부정확한 결과 가능
+> - `combined_search`가 태그 검색을 자동 병행하므로 한국어만으로도 단독 벡터 검색보다 나은 결과를 얻을 수 있음
+
+---
+
 ## MCP 서버
 
 | 서버 | 주요 툴 | 사용 에이전트 |
 |------|---------|-------------|
-| `context_search` | `search_context`, `list_tags` | 02, 07 |
+| `context_search` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 07 |
 | `log_analyzer` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |

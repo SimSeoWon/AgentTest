@@ -458,10 +458,21 @@ SKILL_INDEX = """\
 ## 실행 방법
 - **자동**: watch.py가 새 커밋 감지 시 01_소스분석 자동 실행
 - **자동 (에셋)**: .uasset / .umap 변경 감지 시 DataValidation 자동 실행
+- **자동 (벡터)**: 컨텍스트 생성 후 벡터 인덱스 자동 갱신
 - **수동 (로그)**: 08_로그분석에 .log 파일 경로 전달
 - **수동 (크래시)**: 09_크래시분석에 크래시 폴더 또는 파일 경로 전달
 - **수동 (에셋)**: 10_에셋검증에 에셋 검증 요청
 - **전체 리뷰**: 07_코드매니저를 호출하여 전체 파이프라인 실행
+
+## RAG 검색
+- `combined_search(query, tags?)` — **벡터 + 태그 통합 검색** (항상 이 툴을 우선 사용)
+  - 벡터 검색(의미 기반)과 태그 검색(키워드 기반)을 동시에 수행하여 결과를 병합
+  - tags 미지정 시 벡터 결과에서 자동 추출하여 태그 검색도 수행
+- `vector_search(query)` — 벡터 의미 검색만 단독 수행 (특수한 경우)
+- `search_context(tags)` — 태그 검색만 단독 수행 (특수한 경우)
+- `rebuild_index()` — 전체 벡터 인덱스 재구축
+- `index_status()` — 인덱스 상태 확인
+- watch.py가 컨텍스트 갱신 시 자동으로 벡터 인덱스도 갱신함
 """
 
 # ─────────────────────────────────────────
@@ -649,7 +660,7 @@ Git 커밋 감지 → RAG 컨텍스트 자동 갱신 → 다중 에이전트 분
 ### 등록된 MCP 서버
 | 서버 | 실행 파일 | 주요 툴 |
 |------|-----------|---------|
-| `context-search` | `.claude/mcp/context_search.exe` | `search_context`, `list_tags` |
+| `context-search` | `.claude/mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` |
 | `log-analyzer` | `.claude/mcp/log_analyzer.exe` | `analyze_log`, `search_log` |
 | `crash-analyzer` | `.claude/mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` |
 | `commandlet-runner` | `.claude/mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` |

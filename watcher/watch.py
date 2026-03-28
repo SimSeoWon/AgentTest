@@ -86,7 +86,6 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
         use_gemini_raw = input("분석에 Gemini CLI 사용 (기본값: n) [y/n]: ").strip().lower()
         use_gemini = use_gemini_raw == 'y'
     else:
-        print("Gemini CLI가 감지되지 않아 Claude를 사용합니다.")
         use_gemini = False
 
     config = {
@@ -185,14 +184,42 @@ def _merge_agents(agents_dir: Path) -> list[str]:
 
 def _update_project_settings(claude_dir: Path):
     """
-    .claude/settings.json에 MCP 서버를 머지한다.
+    MCP 서버를 두 곳에 머지한다:
+      1. 프로젝트 루트 .mcp.json — Claude Code가 실제로 읽는 파일
+      2. .claude/settings.json — 에이전트 레벨 참조용 (하위 호환)
     - 이미 등록된 서버는 보존 (사용자 커스텀 유지)
     - 누락된 서버만 추가
     - 항상 실행 (기존 파일 여부 무관)
     """
+    base_dir = claude_dir.parent
+
+    # 1. .mcp.json (프로젝트 루트) — Claude Code가 읽는 MCP 설정
+    mcp_json_path = base_dir / ".mcp.json"
+    mcp_json: dict = {}
+    if mcp_json_path.exists():
+        try:
+            mcp_json = json.loads(mcp_json_path.read_text(encoding='utf-8'))
+        except Exception:
+            mcp_json = {}
+
+    mcp_servers = mcp_json.setdefault("mcpServers", {})
+    added_mcp = []
+    for name, exe in MCP_SERVERS.items():
+        if name not in mcp_servers:
+            mcp_servers[name] = {"command": exe, "args": []}
+            added_mcp.append(name)
+
+    mcp_json_path.write_text(
+        json.dumps(mcp_json, ensure_ascii=False, indent=2),
+        encoding='utf-8'
+    )
+
+    if added_mcp:
+        log(f".mcp.json MCP 등록 추가: {', '.join(added_mcp)}")
+
+    # 2. .claude/settings.json — 하위 호환 및 에이전트 참조용
     settings_path = claude_dir / "settings.json"
     settings: dict = {}
-
     if settings_path.exists():
         try:
             settings = json.loads(settings_path.read_text(encoding='utf-8'))
@@ -307,6 +334,64 @@ def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]
         cwd=repo_dir, capture_output=True, text=True
     )
     return [f for f in result.stdout.strip().split('\n') if f]
+
+
+# ─────────────────────────────────────────
+# 벡터 인덱싱 (context_search.exe에 위임)
+# ─────────────────────────────────────────
+
+def _get_context_search_cmd(base_dir: Path) -> list[str]:
+    """context_search 실행 명령어를 반환한다. exe 없으면 Python 직접 실행."""
+    exe = base_dir / ".claude" / "mcp" / "context_search.exe"
+    if exe.exists():
+        return [str(exe)]
+    # 개발 모드: Python 스크립트 직접 실행
+    script = Path(__file__).parent.parent / "mcp" / "context_search" / "server.py"
+    if script.exists():
+        return [sys.executable, str(script)]
+    return []
+
+
+def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[str] | None = None):
+    """
+    context_search.exe를 CLI 모드로 호출하여 벡터 인덱싱을 수행한다.
+    changed_files 지정 시 해당 파일의 MD만 upsert, 미지정 시 전체 rebuild.
+    """
+    cmd_base = _get_context_search_cmd(base_dir)
+    if not cmd_base:
+        log("[경고] context_search를 찾을 수 없어 벡터 인덱싱 건너뜀")
+        return
+
+    if changed_files:
+        # 변경된 소스 파일에 대응하는 MD 파일 경로 수집
+        md_paths = []
+        for f in changed_files:
+            md_path = context_dir / Path(f).with_suffix('.md')
+            if md_path.exists():
+                md_paths.append(str(md_path.relative_to(context_dir)).replace("\\", "/"))
+        if not md_paths:
+            return
+        cmd = cmd_base + ["--upsert", str(base_dir)] + md_paths
+    else:
+        cmd = cmd_base + ["--rebuild", str(base_dir)]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=120
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json as _json
+            info = _json.loads(result.stdout.strip())
+            count = info.get("indexed_files") or info.get("upserted_files") or 0
+            if count:
+                log(f"벡터 인덱스 갱신: {count}개 문서")
+        elif result.returncode != 0:
+            log(f"[경고] 벡터 인덱싱 실패: {result.stderr[:200]}")
+    except subprocess.TimeoutExpired:
+        log("[경고] 벡터 인덱싱 타임아웃 (120초)")
+    except Exception as e:
+        log(f"[경고] 벡터 인덱싱 오류: {e}")
 
 
 # ─────────────────────────────────────────
@@ -655,11 +740,14 @@ def main():
     context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
     llm_label = "Gemini" if use_gemini else "Claude"
+    vector_ok = bool(_get_context_search_cmd(base_dir))
+    vector_label = "ON" if vector_ok else "OFF (context_search 없음)"
     log(
         f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | "
         f"자동 리뷰: {'ON' if auto_review else 'OFF'} | "
         f"에셋 검증: {'ON' if auto_asset_validation else 'OFF'} | "
-        f"분석 엔진: {llm_label}"
+        f"분석 엔진: {llm_label} | "
+        f"벡터 RAG: {vector_label}"
     )
     log(f"컨텍스트: {context_dir}")
     log(f"리뷰 저장: {reviews_dir}")
@@ -667,6 +755,12 @@ def main():
 
     last_hash = load_state(base_dir) or get_local_hash(repo_dir)
     save_state(base_dir, last_hash)
+
+    # 최초 실행 또는 인덱스 없을 때 전체 벡터 인덱싱
+    vector_db_path = base_dir / ".claude" / "vector_db"
+    if not vector_db_path.exists():
+        log("벡터 인덱스 초기 구축 중...")
+        update_vector_index(context_dir, base_dir)
 
     log("감시 시작... (종료: Ctrl+C)")
 
@@ -687,6 +781,10 @@ def main():
                         log("컨텍스트 갱신 중...")
                         update_context(repo_dir, context_dir, changed_files)
                         log("컨텍스트 갱신 완료")
+
+                        log("벡터 인덱스 갱신 중...")
+                        update_vector_index(context_dir, base_dir, changed_files)
+                        log("벡터 인덱스 갱신 완료")
 
                         if auto_review:
                             run_code_review(repo_dir, context_dir, reviews_dir, changed_files, remote_hash, use_gemini=use_gemini)

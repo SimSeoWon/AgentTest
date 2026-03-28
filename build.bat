@@ -5,7 +5,7 @@ echo ===================================
 echo  AgentTest - Full Build
 echo ===================================
 
-pip install pyinstaller mcp >nul 2>&1
+pip install pyinstaller mcp chromadb >nul 2>&1
 
 echo.
 echo [1/6] Building watch.exe ...
@@ -23,6 +23,9 @@ pyinstaller -y ^
     --onefile ^
     --distpath "dist\.claude\mcp" ^
     --name "context_search" ^
+    --collect-all chromadb ^
+    --collect-all onnxruntime ^
+    --hidden-import=tokenizers ^
     mcp/context_search/server.py
 
 echo.
@@ -56,6 +59,18 @@ pyinstaller -y ^
     --distpath "dist\.claude\mcp" ^
     --name "gemini_query" ^
     mcp/gemini_query/server.py
+
+echo.
+echo Bundling ONNX embedding model ...
+set "ONNX_SRC=%USERPROFILE%\.cache\chroma\onnx_models\all-MiniLM-L6-v2\onnx"
+set "ONNX_DST=dist\.claude\mcp\onnx_model"
+if exist "%ONNX_SRC%\model.onnx" (
+    if not exist "%ONNX_DST%" mkdir "%ONNX_DST%"
+    xcopy /Y /Q "%ONNX_SRC%\*" "%ONNX_DST%\" >nul
+    echo   ONNX model bundled from cache.
+) else (
+    echo   [WARNING] ONNX model not found in cache. Run context_search.exe once to download.
+)
 
 echo.
 echo Packaging AgentWatch.zip ...

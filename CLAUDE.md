@@ -29,14 +29,14 @@ AgentTest/                         ← 이 저장소
 │   └── agent_templates.py         ← 에이전트/MCP 템플릿 상수 모음 (watch.py가 import)
 ├── mcp/
 │   ├── context_search/
-│   │   └── server.py              ← 태그 기반 컨텍스트 검색 MCP
+│   │   └── server.py              ← 태그 + 벡터 검색 MCP (ChromaDB)
 │   ├── log_analyzer/
 │   │   └── server.py              ← UE5 로그 파일 분석 MCP
 │   ├── crash_analyzer/
 │   │   └── server.py              ← UE5 크래시 덤프/로그 분석 MCP
 │   └── commandlet_runner/
 │       └── server.py              ← UE5 커맨드렛 실행 MCP (DataValidation 등)
-├── build.bat                      ← 전체 빌드 스크립트 (watch.exe + MCP 4종)
+├── build.bat                      ← 전체 빌드 스크립트 (watch.exe + MCP 5종)
 └── CLAUDE.md
 ```
 
@@ -67,7 +67,9 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 │   │   ├── context_search.exe
 │   │   ├── log_analyzer.exe
 │   │   ├── crash_analyzer.exe
-│   │   └── commandlet_runner.exe
+│   │   ├── commandlet_runner.exe
+│   │   └── gemini_query.exe
+│   ├── vector_db/                   ← ChromaDB 벡터 인덱스 (자동 생성)
 │   ├── reviews/                   ← 커밋별 코드 리뷰 / 에셋 검증 리포트
 │   ├── context/                   ← 변경된 소스 파일 → Claude가 생성한 MD
 │   │   ├── AI/
@@ -114,7 +116,8 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 
 | 대상 | 최초 실행 | 재실행 (이미 존재) |
 |------|----------|-----------------|
-| `.claude/settings.json` mcpServers | 등록 | 누락된 서버만 추가, 기존 항목 보존 |
+| `.mcp.json` (프로젝트 루트) mcpServers | 등록 | 누락된 서버만 추가, 기존 항목 보존 |
+| `.claude/settings.json` mcpServers | 등록 | 누락된 서버만 추가 (하위 호환) |
 | `CLAUDE.md` (프로젝트 루트) | 생성 | AgentWatch 마커 구역만 갱신, 기존 내용 보존 |
 | `.claude/CLAUDE.md` | 건드리지 않음 | 존재 시 마커 구역 갱신 (팀 규칙 파일 대응) |
 | `context/` 도메인 폴더 | 생성 | 없는 폴더만 추가 |
@@ -125,17 +128,19 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 | `config.json` | 생성 (auto_review 포함) | 보존 |
 
 **기존 Claude 환경 대응 (`_update_project_settings` + `_update_project_claude_md`)**
-- 이미 `.claude/settings.json`이 있어도 `mcpServers` 키를 머지하여 MCP 4종이 항상 등록됨
+- `.mcp.json`(프로젝트 루트)에 MCP 5종 머지 — Claude Code가 실제로 읽는 파일
+- `.claude/settings.json`에도 동일하게 머지 — 에이전트 레벨 참조 및 하위 호환
 - 이미 `CLAUDE.md`가 있어도 `<!-- AgentWatch:Start -->` ~ `<!-- AgentWatch:End -->` 마커 구역을 삽입/갱신
   - 마커가 없으면 파일 끝에 추가, 있으면 해당 구역만 최신 내용으로 교체
   - 마커 외부(사용자 작성 내용)는 절대 건드리지 않음
 
 **감시 루프**
 - `git fetch` → remote 해시와 local 해시 비교
-- 변경 감지 시: `git pull` → `git diff --name-only` → 아래 세 작업 순차 실행
+- 변경 감지 시: `git pull` → `git diff --name-only` → 아래 네 작업 순차 실행
   1. **컨텍스트 갱신** (`update_context`) — `01_소스분석` 프롬프트로 MD 생성 → `context/`
-  2. **코드 리뷰** (`run_code_review`) — `auto_review: true` 시에만 실행 → `reviews/`
-  3. **에셋 검증** (`run_asset_validation`) — `auto_asset_validation: true` 시에만 실행 → `reviews/`
+  2. **벡터 인덱싱** (`update_vector_index`) — 생성된 MD를 ChromaDB에 upsert → `vector_db/`
+  3. **코드 리뷰** (`run_code_review`) — `auto_review: true` 시에만 실행 → `reviews/`
+  4. **에셋 검증** (`run_asset_validation`) — `auto_asset_validation: true` 시에만 실행 → `reviews/`
 - 소스 대상 확장자: `.cpp`, `.h`, `.hpp`, `.inl`, `.cs`, `.py`
 - 에셋 대상 확장자: `.uasset`, `.umap`
 - `.watch_state` 파일로 마지막 커밋 해시 영속 저장 (멱등성 보장)
@@ -176,7 +181,7 @@ claude -p "[프롬프트]" --dangerously-skip-permissions
 
 | 서버 | 빌드 산출물 | 제공 툴 | 사용 에이전트 |
 |------|------------|---------|-------------|
-| `context_search` | `mcp/context_search.exe` | `search_context`, `list_tags` | 02, 07 |
+| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 07 |
 | `log_analyzer` | `mcp/log_analyzer.exe` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |
@@ -222,6 +227,60 @@ related_classes:
 
 ---
 
+## RAG 검색
+
+### 통합 검색 (`combined_search`)
+에이전트는 **항상 `combined_search`를 우선 사용**한다. 이 툴은 내부적으로:
+1. 벡터 검색(의미 기반) 수행
+2. 벡터 결과에서 태그를 자동 추출 + 사용자 지정 태그 병합
+3. 태그 검색(키워드 기반) 수행
+4. 두 결과를 병합·중복 제거하여 반환 (both > vector > tag 순 정렬)
+
+### 아키텍처
+```
+watch.exe → context MD 생성 → context_search.exe --upsert 호출 → ChromaDB 저장
+                                context_search.exe (MCP 모드) ← 에이전트가 combined_search 호출
+```
+- chromadb는 **context_search.exe에만** 번들됨 (watch.exe는 가벼움 유지)
+- watch.py는 subprocess로 context_search.exe를 CLI 모드로 호출
+
+### 구성 요소
+| 구성요소 | 기술 | 비고 |
+|----------|------|------|
+| 임베딩 모델 | `all-MiniLM-L6-v2` (ONNX) | ChromaDB 내장, 384차원 |
+| 벡터 DB | ChromaDB PersistentClient | `.claude/vector_db/` 에 파일 기반 저장 |
+| 인덱싱 | `watch.py` → `context_search.exe --upsert` | subprocess 위임 |
+| 검색 | `context_search` MCP → `combined_search()` | 벡터+태그 통합 검색 |
+
+### context_search.exe CLI 모드
+```
+context_search.exe --rebuild <project_root>                   전체 재구축
+context_search.exe --upsert  <project_root> <md1> <md2> ...  증분 갱신
+context_search.exe --status  <project_root>                   상태 확인
+context_search.exe                                            MCP 서버 모드 (기본)
+```
+
+### 인덱싱 흐름
+1. **최초 실행**: `vector_db/` 없으면 `--rebuild`로 전체 인덱싱
+2. **커밋 감지**: 변경된 파일의 MD만 `--upsert`로 증분 갱신
+3. **수동 재구축**: `rebuild_index()` MCP 툴 또는 `--rebuild` CLI
+
+### 검색 흐름
+```
+유저 질문 → combined_search(query, tags?)
+           ├→ vector_search → 임베딩 → 코사인 유사도 상위 k개
+           └→ search_context → 벡터 결과 태그 + 사용자 태그로 키워드 검색
+           → 결과 병합·중복 제거 → 반환
+```
+- `category_filter` 파라미터로 도메인 필터링 가능
+- `tags` 파라미터로 명시적 태그 추가 가능 (미지정 시 벡터 결과에서 자동 추출)
+
+### 의존성
+- `chromadb` — context_search.exe에만 번들 (`onnxruntime` + `tokenizers` 포함)
+- watch.exe에는 chromadb 미포함 (기존과 동일한 경량 크기 유지)
+
+---
+
 ## 핵심 설계 결정
 
 | 결정 사항 | 이유 |
@@ -232,6 +291,8 @@ related_classes:
 | 에이전트별 `settings.json` | MCP 연결과 허용 툴을 에이전트 단위로 격리 |
 | `.watch_state` 파일로 상태 저장 | 재시작해도 중복 처리 없음 (멱등성) |
 | Claude CLI 외부 호출 | 직원 PC의 Claude 계정/설정 재사용 가능 |
+| ChromaDB + ONNX 임베딩 | PyTorch 불필요(~2GB 절약), 로컬 완결, 오프라인 동작 |
+| 증분 벡터 인덱싱 | 변경된 파일만 upsert — 전체 재인덱싱 불필요 |
 
 ---
 
