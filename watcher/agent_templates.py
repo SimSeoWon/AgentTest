@@ -483,6 +483,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
             "context-search": {
                 "command": "./.claude/mcp/context_search.exe",
                 "args": []
+            },
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
+                "args": []
             }
         },
     },
@@ -491,6 +495,12 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "description": "코딩 컨벤션 준수 여부를 검토한다. 파일 읽기 전용.",
         "allowedTools": ["Read", "Grep"],
         "scope": "repo",
+        "mcpServers": {
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
+                "args": []
+            }
+        },
     },
 
     "04_코드작성": {
@@ -503,6 +513,12 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "description": "잠재적 버그, 메모리 누수, 스레드 안전성 이슈를 탐지한다. 읽기 전용.",
         "allowedTools": ["Read", "Grep", "Glob"],
         "scope": "repo",
+        "mcpServers": {
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
+                "args": []
+            }
+        },
     },
 
     "06_빌드_통합": {
@@ -521,6 +537,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
             "context-search": {
                 "command": "./.claude/mcp/context_search.exe",
                 "args": []
+            },
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
+                "args": []
             }
         },
     },
@@ -536,6 +556,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
             },
             "context-search": {
                 "command": "./.claude/mcp/context_search.exe",
+                "args": []
+            },
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
                 "args": []
             }
         },
@@ -553,6 +577,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
             "context-search": {
                 "command": "./.claude/mcp/context_search.exe",
                 "args": []
+            },
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
+                "args": []
             }
         },
     },
@@ -569,6 +597,10 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
             "context-search": {
                 "command": "./.claude/mcp/context_search.exe",
                 "args": []
+            },
+            "gemini-query": {
+                "command": "./.claude/mcp/gemini_query.exe",
+                "args": []
             }
         },
     },
@@ -580,6 +612,7 @@ MCP_SERVERS: dict[str, str] = {
     "log-analyzer":      "./.claude/mcp/log_analyzer.exe",
     "crash-analyzer":    "./.claude/mcp/crash_analyzer.exe",
     "commandlet-runner": "./.claude/mcp/commandlet_runner.exe",
+    "gemini-query":      "./.claude/mcp/gemini_query.exe",
 }
 
 # CLAUDE.md 에 삽입/갱신하는 AgentWatch 관리 구역
@@ -620,6 +653,7 @@ Git 커밋 감지 → RAG 컨텍스트 자동 갱신 → 다중 에이전트 분
 | `log-analyzer` | `.claude/mcp/log_analyzer.exe` | `analyze_log`, `search_log` |
 | `crash-analyzer` | `.claude/mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` |
 | `commandlet-runner` | `.claude/mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` |
+| `gemini-query` | `.claude/mcp/gemini_query.exe` | `gemini_analyze`, `gemini_status` (Gemini CLI 미설치 시 안내 반환) |
 <!-- AgentWatch:End -->"""
 
 # 기본 컨텍스트 도메인 폴더 목록

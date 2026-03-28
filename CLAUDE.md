@@ -180,20 +180,23 @@ claude -p "[프롬프트]" --dangerously-skip-permissions
 | `log_analyzer` | `mcp/log_analyzer.exe` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |
+| `gemini_query` | `mcp/gemini_query.exe` | `gemini_analyze`, `gemini_status` | 02, 07 |
 
 - `crash_analyzer`는 `cdb.exe`(Windows SDK) 유무를 자동 감지하여 `.dmp` 직접 분석 또는 XML/로그 폴백
 - `commandlet_runner`는 `.uproject`의 `EngineAssociation` → `winreg` → `%ProgramFiles%` 순으로 엔진 탐색
+- `gemini_query`는 `gemini` CLI 미설치 환경에서 안내 메시지 반환 (크래시 없음)
 - 모든 MCP는 `./.claude/mcp/<name>.exe` 경로로 각 에이전트의 `settings.json`에 등록됨
 
 ### 4. `build.bat`
 
-총 5단계 빌드:
+총 6단계 빌드:
 ```
-[1/5] watch.exe              ← --paths "watcher" 로 agent_templates.py 인식
-[2/5] context_search.exe
-[3/5] log_analyzer.exe
-[4/5] crash_analyzer.exe
-[5/5] commandlet_runner.exe  → 모두 dist/.claude/mcp/ 에 출력
+[1/6] watch.exe              ← --paths "watcher" 로 agent_templates.py 인식
+[2/6] context_search.exe
+[3/6] log_analyzer.exe
+[4/6] crash_analyzer.exe
+[5/6] commandlet_runner.exe
+[6/6] gemini_query.exe       → 모두 dist/.claude/mcp/ 에 출력
 ```
 
 ---

@@ -2,6 +2,7 @@ import re
 import sys
 import json
 import time
+import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -80,11 +81,20 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     auto_asset_raw = input("에셋 변경 시 커맨드렛 검증 자동 실행 (기본값: y) [y/n]: ").strip().lower()
     auto_asset_validation = auto_asset_raw != 'n'
 
+    gemini_available = shutil.which("gemini") is not None
+    if gemini_available:
+        use_gemini_raw = input("분석에 Gemini CLI 사용 (기본값: n) [y/n]: ").strip().lower()
+        use_gemini = use_gemini_raw == 'y'
+    else:
+        print("Gemini CLI가 감지되지 않아 Claude를 사용합니다.")
+        use_gemini = False
+
     config = {
         "branch": branch,
         "poll_interval": poll_interval,
         "auto_review": auto_review,
         "auto_asset_validation": auto_asset_validation,
+        "use_gemini": use_gemini,
         "repo_dir": str(repo_dir),
     }
 
@@ -340,6 +350,7 @@ def run_code_review(
     reviews_dir: Path,
     changed_files: list[str],
     commit_hash: str,
+    use_gemini: bool = False,
 ):
     """변경된 파일에 대해 코드 리뷰를 실행하고 .claude/reviews/ 에 저장한다."""
     reviewable = [
@@ -368,20 +379,22 @@ def run_code_review(
 
         print(f"  [리뷰] {file_path}")
 
-        convention = _call_claude(
+        convention = _call_llm(
             f"아래 코드가 UE5 팀 코딩 컨벤션을 준수하는지 검토해줘.\n"
             f"검토 기준: 클래스명 파스칼케이스, 함수명 파스칼케이스, "
             f"멤버변수 접두사(b/f/i), public 함수 주석 필수.\n"
             f"결과를 표로 정리해줘: | 항목 | 위반 내용 | 라인 | 심각도 |\n\n"
-            f"파일: {file_path}\n```\n{content}\n```"
+            f"파일: {file_path}\n```\n{content}\n```",
+            use_gemini=use_gemini,
         )
 
-        validation = _call_claude(
+        validation = _call_llm(
             f"아래 코드에서 잠재적 버그와 안전성 이슈를 찾아줘.\n"
             f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토해줘.\n"
             f"형식: | 위험도 | 라인 | 설명 | 권장 수정 |\n\n"
             f"관련 컨텍스트:\n{context[:1000]}\n\n"
-            f"파일: {file_path}\n```\n{content}\n```"
+            f"파일: {file_path}\n```\n{content}\n```",
+            use_gemini=use_gemini,
         )
 
         file_reviews.append({
@@ -395,7 +408,7 @@ def run_code_review(
 
     # 07_코드매니저로 통합 리포트 생성
     log("통합 리포트 생성 중...")
-    report = _build_review_report(file_reviews, commit_hash)
+    report = _build_review_report(file_reviews, commit_hash, use_gemini=use_gemini)
 
     timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
     report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}.md"
@@ -403,7 +416,7 @@ def run_code_review(
     log(f"코드 리뷰 완료 → {report_path.relative_to(reviews_dir.parent.parent)}")
 
 
-def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
+def _build_review_report(file_reviews: list[dict], commit_hash: str, use_gemini: bool = False) -> str:
     """07_코드매니저 프롬프트로 통합 리포트를 생성한다."""
     files_summary = "\n\n".join(
         f"### {r['file']}\n"
@@ -425,7 +438,7 @@ def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
         f"## 액션 아이템"
     )
 
-    result = _call_claude(prompt)
+    result = _call_llm(prompt, use_gemini=use_gemini)
     if result:
         return f"# 코드 리뷰 리포트\n\n커밋: `{commit_hash}`  \n생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n{result}"
 
@@ -448,6 +461,28 @@ def _call_claude(prompt: str) -> str | None:
         print(f"[오류] Claude 호출 실패: {result.stderr[:200]}")
         return None
     return result.stdout
+
+
+def _call_gemini(prompt: str) -> str | None:
+    """Gemini CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None."""
+    if not shutil.which("gemini"):
+        print("[경고] Gemini CLI를 찾을 수 없어 Claude로 대체합니다.")
+        return _call_claude(prompt)
+    result = subprocess.run(
+        ["gemini", "-y", prompt],
+        capture_output=True, text=True, encoding='utf-8', errors='replace'
+    )
+    if result.returncode != 0:
+        print(f"[오류] Gemini 호출 실패: {result.stderr[:200]}")
+        return None
+    return result.stdout
+
+
+def _call_llm(prompt: str, use_gemini: bool = False) -> str | None:
+    """use_gemini 플래그에 따라 Gemini 또는 Claude를 호출한다."""
+    if use_gemini:
+        return _call_gemini(prompt)
+    return _call_claude(prompt)
 
 
 # ─────────────────────────────────────────
@@ -516,6 +551,7 @@ def run_asset_validation(
     reviews_dir: Path,
     changed_files: list[str],
     commit_hash: str,
+    use_gemini: bool = False,
 ):
     """변경된 .uasset / .umap 파일에 대해 DataValidation 커맨드렛을 실행한다."""
     assets = [f for f in changed_files if Path(f).suffix in ASSET_EXTENSIONS]
@@ -557,7 +593,7 @@ def run_asset_validation(
         f"## 수정 필요 항목"
     )
 
-    analysis = _call_claude(prompt)
+    analysis = _call_llm(prompt, use_gemini=use_gemini)
 
     timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
     report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}_assets.md"
@@ -614,13 +650,16 @@ def main():
     poll_interval = config["poll_interval"]
     auto_review = config.get("auto_review", True)
     auto_asset_validation = config.get("auto_asset_validation", True)
+    use_gemini = config.get("use_gemini", False) and bool(shutil.which("gemini"))
 
     context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
+    llm_label = "Gemini" if use_gemini else "Claude"
     log(
         f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | "
         f"자동 리뷰: {'ON' if auto_review else 'OFF'} | "
-        f"에셋 검증: {'ON' if auto_asset_validation else 'OFF'}"
+        f"에셋 검증: {'ON' if auto_asset_validation else 'OFF'} | "
+        f"분석 엔진: {llm_label}"
     )
     log(f"컨텍스트: {context_dir}")
     log(f"리뷰 저장: {reviews_dir}")
@@ -650,10 +689,10 @@ def main():
                         log("컨텍스트 갱신 완료")
 
                         if auto_review:
-                            run_code_review(repo_dir, context_dir, reviews_dir, changed_files, remote_hash)
+                            run_code_review(repo_dir, context_dir, reviews_dir, changed_files, remote_hash, use_gemini=use_gemini)
 
                         if auto_asset_validation:
-                            run_asset_validation(base_dir, reviews_dir, changed_files, remote_hash)
+                            run_asset_validation(base_dir, reviews_dir, changed_files, remote_hash, use_gemini=use_gemini)
 
                         last_hash = remote_hash
                         save_state(base_dir, last_hash)
