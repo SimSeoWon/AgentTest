@@ -425,7 +425,7 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "scope": "repo",
         "mcpServers": {
             "context-search": {
-                "command": "./mcp/context_search.exe",
+                "command": "./.claude/mcp/context_search.exe",
                 "args": []
             }
         },
@@ -463,7 +463,7 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "scope": "project",
         "mcpServers": {
             "context-search": {
-                "command": "./mcp/context_search.exe",
+                "command": "./.claude/mcp/context_search.exe",
                 "args": []
             }
         },
@@ -475,11 +475,11 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "scope": "project",
         "mcpServers": {
             "log-analyzer": {
-                "command": "./mcp/log_analyzer.exe",
+                "command": "./.claude/mcp/log_analyzer.exe",
                 "args": []
             },
             "context-search": {
-                "command": "./mcp/context_search.exe",
+                "command": "./.claude/mcp/context_search.exe",
                 "args": []
             }
         },
@@ -491,11 +491,11 @@ SETTINGS_TEMPLATES: dict[str, dict] = {
         "scope": "project",
         "mcpServers": {
             "crash-analyzer": {
-                "command": "./mcp/crash_analyzer.exe",
+                "command": "./.claude/mcp/crash_analyzer.exe",
                 "args": []
             },
             "context-search": {
-                "command": "./mcp/context_search.exe",
+                "command": "./.claude/mcp/context_search.exe",
                 "args": []
             }
         },

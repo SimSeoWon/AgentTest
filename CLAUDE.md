@@ -40,12 +40,14 @@ AgentTest/                         ← 이 저장소
 
 ### 빌드 산출물 (`.gitignore` 제외 — git 미추적)
 ```
-dist/          ← 배포 패키지 전체
-build/         ← PyInstaller 임시 파일
-*.spec         ← PyInstaller 스펙 파일
+dist/           ← PyInstaller 빌드 결과
+build/          ← PyInstaller 임시 파일
+*.spec          ← PyInstaller 스펙 파일
+AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 ```
 
-배포 시 `dist/` 폴더를 직원에게 직접 전달한다.
+`build.bat` 완료 후 `AgentWatch.zip`이 자동 생성된다. 이 파일을 팀원에게 전달한다.
+설치 방법은 `INSTALL.md` 참고.
 
 ---
 
@@ -59,6 +61,11 @@ build/         ← PyInstaller 임시 파일
 │   └── .git/                      ← watch.exe가 자동 탐지하는 Git 저장소
 ├── .claude/
 │   ├── settings.json
+│   ├── mcp/                       ← MCP 실행 파일
+│   │   ├── context_search.exe
+│   │   ├── log_analyzer.exe
+│   │   └── crash_analyzer.exe
+│   ├── reviews/                   ← 커밋별 코드 리뷰 리포트 (YYYY-MM-DD_HHMM_<hash>.md)
 │   ├── context/                   ← 변경된 소스 파일 → Claude가 생성한 MD
 │   │   ├── AI/
 │   │   ├── UI/
@@ -81,10 +88,6 @@ build/         ← PyInstaller 임시 파일
 │       ├── 07_코드매니저/
 │       ├── 08_로그분석/
 │       └── 09_크래시분석/
-├── mcp/
-│   ├── context_search.exe
-│   ├── log_analyzer.exe
-│   └── crash_analyzer.exe
 ├── config.json                    ← 브랜치명, 폴링 간격 저장 (최초 실행 시 생성)
 ├── .watch_state                   ← 마지막 확인 커밋 해시 (멱등성 보장)
 └── watch.exe
@@ -109,17 +112,25 @@ build/         ← PyInstaller 임시 파일
 |------|----------|-----------------|
 | `.claude/settings.json` | 생성 | 보존 (사용자 설정 유지) |
 | `context/` 도메인 폴더 | 생성 | 없는 폴더만 추가 |
+| `reviews/` 폴더 | 생성 | 유지 |
 | 에이전트 폴더 | 생성 | 없는 폴더만 추가 |
 | `role.md` / `prompt.md` / `settings.json` | 생성 | 보존 (커스텀 보호) |
 | `SKILL_INDEX.md` | 생성 | **항상 덮어쓰기** (인덱스 최신 유지) |
-| `config.json` | 생성 | 보존 |
+| `config.json` | 생성 (auto_review 포함) | 보존 |
 
 **감시 루프**
 - `git fetch` → remote 해시와 local 해시 비교
-- 변경 감지 시: `git pull` → `git diff --name-only` → 대상 파일별 Claude CLI 호출
+- 변경 감지 시: `git pull` → `git diff --name-only` → 아래 두 작업 순차 실행
+  1. **컨텍스트 갱신** (`update_context`) — `01_소스분석` 프롬프트로 MD 생성 → `context/`
+  2. **코드 리뷰** (`run_code_review`) — `auto_review: true` 시에만 실행 → `reviews/`
 - 대상 확장자: `.cpp`, `.h`, `.hpp`, `.inl`, `.cs`, `.py`
-- 컨텍스트 출력: `context/[git 상대경로].md` (디렉토리 구조 미러링)
 - `.watch_state` 파일로 마지막 커밋 해시 영속 저장 (멱등성 보장)
+
+**코드 리뷰 흐름 (`run_code_review`)**
+- 파일별: `03_코드규약` + `05_코드검증` 각각 Claude CLI 호출
+- 전체 취합: `07_코드매니저` 프롬프트로 통합 리포트 생성
+- 저장: `.claude/reviews/YYYY-MM-DD_HHMM_<커밋해시>.md`
+- `config.json`의 `auto_review: false` 로 비활성화 가능
 
 **Claude CLI 호출 방식**
 ```

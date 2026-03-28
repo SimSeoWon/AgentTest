@@ -2,6 +2,7 @@
 dist/
 build/
 *.spec
+AgentWatch.zip
 
 # Python
 __pycache__/

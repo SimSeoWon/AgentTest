@@ -12,6 +12,7 @@ from agent_templates import (
 
 CONFIG_FILE = "config.json"
 STATE_FILE = ".watch_state"
+TARGET_EXTENSIONS = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}
 
 
 def get_base_dir() -> Path:
@@ -29,16 +30,13 @@ def find_git_repo(base_dir: Path) -> Path:
       2. base_dir 자체
       3. base_dir의 직접 하위 폴더들
     """
-    # 1순위: Source 서브폴더 (Unreal 프로젝트 표준 구조)
     source_dir = base_dir / "Source"
     if (source_dir / ".git").exists():
         return source_dir
 
-    # 2순위: exe가 있는 폴더 자체
     if (base_dir / ".git").exists():
         return base_dir
 
-    # 3순위: 직접 하위 폴더 중 .git이 있는 첫 번째
     for child in sorted(base_dir.iterdir()):
         if child.is_dir() and (child / ".git").exists():
             return child
@@ -72,9 +70,13 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     interval_raw = input("폴링 간격 초 (기본값: 60): ").strip()
     poll_interval = int(interval_raw) if interval_raw.isdigit() else 60
 
+    auto_review_raw = input("변경 감지 시 코드 리뷰 자동 실행 (기본값: y) [y/n]: ").strip().lower()
+    auto_review = auto_review_raw != 'n'
+
     config = {
         "branch": branch,
         "poll_interval": poll_interval,
+        "auto_review": auto_review,
         "repo_dir": str(repo_dir),
     }
 
@@ -85,12 +87,10 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     return config
 
 
-def init_project_dirs(base_dir: Path) -> tuple[Path, Path]:
+def init_project_dirs(base_dir: Path) -> tuple[Path, Path, Path]:
     """
     .claude/ 및 하위 디렉토리 초기화 (머지 방식).
-    - 최초 실행: 전체 구조 생성
-    - 재실행: 새 에이전트/도메인 추가, 기존 커스텀 파일 보존
-    반환: (context_dir, agents_dir)
+    반환: (context_dir, agents_dir, reviews_dir)
     """
     claude_dir = base_dir / ".claude"
     is_new = not claude_dir.exists()
@@ -110,6 +110,10 @@ def init_project_dirs(base_dir: Path) -> tuple[Path, Path]:
     for domain in DEFAULT_CONTEXT_DOMAINS:
         (context_dir / domain).mkdir(exist_ok=True)
 
+    # reviews/ — 코드 리뷰 리포트 저장
+    reviews_dir = claude_dir / "reviews"
+    reviews_dir.mkdir(exist_ok=True)
+
     # agents/ — 항상 실행: 새 에이전트가 추가돼도 반영
     agents_dir = claude_dir / "agents"
     agents_dir.mkdir(exist_ok=True)
@@ -120,7 +124,7 @@ def init_project_dirs(base_dir: Path) -> tuple[Path, Path]:
     elif added:
         log(f".claude/ 머지 완료 — 새 에이전트 {len(added)}개 추가: {', '.join(added)}")
 
-    return context_dir, agents_dir
+    return context_dir, agents_dir, reviews_dir
 
 
 def _merge_agents(agents_dir: Path) -> list[str]:
@@ -128,7 +132,7 @@ def _merge_agents(agents_dir: Path) -> list[str]:
     agents/ 하위를 현재 AGENTS 목록과 머지한다.
     - 없는 에이전트 폴더/파일 → 새로 생성
     - 이미 있는 role.md / prompt.md / settings.json → 보존 (커스텀 보호)
-    - SKILL_INDEX.md → 항상 최신으로 덮어쓰기 (인덱스이므로)
+    - SKILL_INDEX.md → 항상 최신으로 덮어쓰기
     반환: 새로 추가된 에이전트 이름 목록
     """
     added = []
@@ -164,8 +168,10 @@ def _merge_agents(agents_dir: Path) -> list[str]:
 
     return added
 
-    log(f"에이전트 폴더 {len(AGENTS)}개 초기화 완료")
 
+# ─────────────────────────────────────────
+# Git 유틸
+# ─────────────────────────────────────────
 
 def git_fetch(repo_dir: Path) -> bool:
     result = subprocess.run(
@@ -209,12 +215,14 @@ def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]
     return [f for f in result.stdout.strip().split('\n') if f]
 
 
-def update_context(repo_dir: Path, context_dir: Path, changed_files: list[str]):
-    target_extensions = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}
+# ─────────────────────────────────────────
+# 컨텍스트 갱신
+# ─────────────────────────────────────────
 
+def update_context(repo_dir: Path, context_dir: Path, changed_files: list[str]):
     for file_path in changed_files:
         full_path = repo_dir / file_path
-        if not full_path.exists() or full_path.suffix not in target_extensions:
+        if not full_path.exists() or full_path.suffix not in TARGET_EXTENSIONS:
             continue
 
         try:
@@ -228,21 +236,139 @@ def update_context(repo_dir: Path, context_dir: Path, changed_files: list[str]):
             content=content[:4000],
         )
 
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--dangerously-skip-permissions"],
-            capture_output=True, text=True, encoding='utf-8'
-        )
-
-        if result.returncode != 0:
-            print(f"[오류] Claude 호출 실패 ({file_path}): {result.stderr}")
+        result = _call_claude(prompt)
+        if result is None:
             continue
 
-        # 파일 경로를 그대로 context/ 아래에 미러링 (.md 확장자로)
         out_path = context_dir / Path(file_path).with_suffix('.md')
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(result.stdout, encoding='utf-8')
-        print(f"  [갱신] {out_path.relative_to(context_dir.parent.parent)}")
+        out_path.write_text(result, encoding='utf-8')
+        print(f"  [컨텍스트] {out_path.relative_to(context_dir.parent.parent)}")
 
+
+# ─────────────────────────────────────────
+# 코드 리뷰
+# ─────────────────────────────────────────
+
+def run_code_review(
+    repo_dir: Path,
+    context_dir: Path,
+    reviews_dir: Path,
+    changed_files: list[str],
+    commit_hash: str,
+):
+    """변경된 파일에 대해 코드 리뷰를 실행하고 .claude/reviews/ 에 저장한다."""
+    reviewable = [
+        f for f in changed_files
+        if (repo_dir / f).exists() and Path(f).suffix in TARGET_EXTENSIONS
+    ]
+
+    if not reviewable:
+        log("리뷰 대상 파일 없음 — 건너뜀")
+        return
+
+    log(f"코드 리뷰 시작 — {len(reviewable)}개 파일")
+
+    file_reviews: list[dict] = []
+
+    for file_path in reviewable:
+        full_path = repo_dir / file_path
+        try:
+            content = full_path.read_text(encoding='utf-8', errors='ignore')[:4000]
+        except Exception:
+            continue
+
+        # 해당 파일의 컨텍스트 MD 로드 (없으면 빈 문자열)
+        context_md = context_dir / Path(file_path).with_suffix('.md')
+        context = context_md.read_text(encoding='utf-8') if context_md.exists() else ""
+
+        print(f"  [리뷰] {file_path}")
+
+        convention = _call_claude(
+            f"아래 코드가 UE5 팀 코딩 컨벤션을 준수하는지 검토해줘.\n"
+            f"검토 기준: 클래스명 파스칼케이스, 함수명 파스칼케이스, "
+            f"멤버변수 접두사(b/f/i), public 함수 주석 필수.\n"
+            f"결과를 표로 정리해줘: | 항목 | 위반 내용 | 라인 | 심각도 |\n\n"
+            f"파일: {file_path}\n```\n{content}\n```"
+        )
+
+        validation = _call_claude(
+            f"아래 코드에서 잠재적 버그와 안전성 이슈를 찾아줘.\n"
+            f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토해줘.\n"
+            f"형식: | 위험도 | 라인 | 설명 | 권장 수정 |\n\n"
+            f"관련 컨텍스트:\n{context[:1000]}\n\n"
+            f"파일: {file_path}\n```\n{content}\n```"
+        )
+
+        file_reviews.append({
+            "file": file_path,
+            "convention": convention or "분석 실패",
+            "validation": validation or "분석 실패",
+        })
+
+    if not file_reviews:
+        return
+
+    # 07_코드매니저로 통합 리포트 생성
+    log("통합 리포트 생성 중...")
+    report = _build_review_report(file_reviews, commit_hash)
+
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+    report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}.md"
+    report_path.write_text(report, encoding='utf-8')
+    log(f"코드 리뷰 완료 → {report_path.relative_to(reviews_dir.parent.parent)}")
+
+
+def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
+    """07_코드매니저 프롬프트로 통합 리포트를 생성한다."""
+    files_summary = "\n\n".join(
+        f"### {r['file']}\n"
+        f"**규약 검토**\n{r['convention']}\n\n"
+        f"**코드 검증**\n{r['validation']}"
+        for r in file_reviews
+    )
+
+    prompt = (
+        f"아래 에이전트 리포트들을 통합하여 최종 코드 리뷰 리포트를 작성해줘.\n\n"
+        f"커밋: {commit_hash}\n"
+        f"검토 파일 수: {len(file_reviews)}개\n\n"
+        f"{files_summary}\n\n"
+        f"최종 리포트 형식:\n"
+        f"## 요약\n"
+        f"## 즉시 수정 필요 (Critical)\n"
+        f"## 권장 수정 (Warning)\n"
+        f"## 참고 사항 (Info)\n"
+        f"## 액션 아이템"
+    )
+
+    result = _call_claude(prompt)
+    if result:
+        return f"# 코드 리뷰 리포트\n\n커밋: `{commit_hash}`  \n생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n{result}"
+
+    # Claude 호출 실패 시 원본 취합본 반환
+    return (
+        f"# 코드 리뷰 리포트\n\n"
+        f"커밋: `{commit_hash}`  \n"
+        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"{files_summary}"
+    )
+
+
+def _call_claude(prompt: str) -> str | None:
+    """Claude CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None."""
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--dangerously-skip-permissions"],
+        capture_output=True, text=True, encoding='utf-8'
+    )
+    if result.returncode != 0:
+        print(f"[오류] Claude 호출 실패: {result.stderr[:200]}")
+        return None
+    return result.stdout
+
+
+# ─────────────────────────────────────────
+# 상태 저장
+# ─────────────────────────────────────────
 
 def load_state(base_dir: Path) -> str | None:
     state_path = base_dir / STATE_FILE
@@ -257,6 +383,10 @@ def log(msg: str):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 
+# ─────────────────────────────────────────
+# 메인
+# ─────────────────────────────────────────
+
 def main():
     base_dir = get_base_dir()
 
@@ -264,7 +394,6 @@ def main():
     print("  Git 컨텍스트 워처")
     print("=" * 50)
 
-    # Git 저장소 자동 탐색
     try:
         repo_dir = find_git_repo(base_dir)
         log(f"Git 저장소 감지: {repo_dir}")
@@ -273,20 +402,18 @@ def main():
         input("\nEnter 키를 눌러 종료...")
         sys.exit(1)
 
-    # 설정 로드 또는 최초 설정
     config = load_or_init_config(base_dir, repo_dir)
     branch = config["branch"]
     poll_interval = config["poll_interval"]
+    auto_review = config.get("auto_review", True)
 
-    # .claude/ 디렉토리 구조 초기화
-    context_dir, agents_dir = init_project_dirs(base_dir)
+    context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
-    log(f"브랜치: {branch} | 폴링 간격: {poll_interval}초")
-    log(f"컨텍스트 경로: {context_dir}")
-    log(f"에이전트 경로: {agents_dir}")
+    log(f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | 자동 리뷰: {'ON' if auto_review else 'OFF'}")
+    log(f"컨텍스트: {context_dir}")
+    log(f"리뷰 저장: {reviews_dir}")
     print()
 
-    # 마지막 확인 커밋 해시 로드
     last_hash = load_state(base_dir) or get_local_hash(repo_dir)
     save_state(base_dir, last_hash)
 
@@ -304,13 +431,17 @@ def main():
 
                     if git_pull(repo_dir, branch):
                         changed_files = get_changed_files(repo_dir, last_hash, remote_hash)
-                        log(f"변경된 파일 {len(changed_files)}개 — 컨텍스트 갱신 중...")
+                        log(f"변경된 파일 {len(changed_files)}개")
 
+                        log("컨텍스트 갱신 중...")
                         update_context(repo_dir, context_dir, changed_files)
+                        log("컨텍스트 갱신 완료")
+
+                        if auto_review:
+                            run_code_review(repo_dir, context_dir, reviews_dir, changed_files, remote_hash)
 
                         last_hash = remote_hash
                         save_state(base_dir, last_hash)
-                        log("컨텍스트 갱신 완료")
                 else:
                     print(
                         f"\r[{datetime.now().strftime('%H:%M:%S')}] 대기 중... "
