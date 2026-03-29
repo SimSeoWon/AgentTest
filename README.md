@@ -10,13 +10,14 @@ Unreal Engine 5 프로젝트 팀을 위한 **Git 변경 감지 → RAG 컨텍스
 팀원은 zip을 UE5 프로젝트 루트에 압축 해제하고 `watch.exe`를 실행하기만 하면 된다.
 
 ```
-Git 변경 감지 → git pull → 소스 분석 → .claude/context/ MD 자동 갱신
-                                      → 벡터 인덱싱 → .claude/vector_db/ 갱신
-                                      → 코드 리뷰 → .claude/reviews/ 저장
-                                      → 에셋 검증 → .claude/reviews/ 저장
+Git 변경 감지 → git pull → 디렉토리(모듈) 단위로 컨텍스트+리뷰 한번에 (병렬 6)
+                         → .claude/context/ MD + .claude/reviews/ 리포트 동시 저장
+                         → 벡터 인덱싱 → .claude/vector_db/ 갱신
+                         → 에셋 검증 → .claude/reviews/ 저장
+                         → 리뷰 상담 (수동) → 개발자 코멘트 기록
 ```
 
-분석 엔진은 **Claude** 또는 **Gemini** 중 선택 가능하다.
+분석 엔진은 **Claude** (Sonnet/Opus/Haiku 선택) 또는 **Gemini** 중 선택 가능하다.
 
 ---
 
@@ -84,6 +85,7 @@ dist/
 | 자동 코드 리뷰 | 커밋 감지 시 자동 리뷰 | `y` |
 | 에셋 검증 | `.uasset`/`.umap` 변경 시 DataValidation 실행 | `y` |
 | Gemini 사용 | 분석 엔진을 Gemini CLI로 전환 (설치 시에만 질문) | `n` |
+| Claude 모델 | 자동 파이프라인용 모델 (sonnet/opus/haiku) | `claude-sonnet-4-6` |
 
 ### 배포 전제 조건 (팀원 PC)
 
@@ -109,9 +111,9 @@ dist/
     ├── settings.json        ← MCP 5종 자동 등록 (기존 설정 머지)
     ├── mcp/                 ← MCP 실행 파일
     ├── vector_db/           ← ChromaDB 벡터 인덱스 (자동 생성)
-    ├── context/             ← 10개 UE5 도메인 폴더
+    ├── context/             ← 디렉토리(모듈) 단위 컨텍스트 MD + 코멘트
     ├── reviews/             ← 코드 리뷰 · 에셋 검증 리포트
-    └── agents/              ← 10개 에이전트 폴더
+    └── agents/              ← 11개 에이전트 폴더
         ├── SKILL_INDEX.md
         ├── 01_소스분석/
         ├── 02_프로젝트분석/
@@ -122,7 +124,8 @@ dist/
         ├── 07_코드매니저/
         ├── 08_로그분석/
         ├── 09_크래시분석/
-        └── 10_에셋검증/
+        ├── 10_에셋검증/
+        └── 11_리뷰상담/
 ```
 
 > 기존 `.claude/` 폴더가 있는 경우 머지 방식으로 동작한다.
@@ -134,8 +137,40 @@ dist/
 
 | 트리거 | 동작 |
 |--------|------|
-| `.cpp` `.h` `.cs` 등 소스 변경 | 컨텍스트 MD 생성 → 코드 리뷰 리포트 |
+| `.cpp` `.h` `.cs` 등 소스 변경 | 디렉토리 단위로 묶어 컨텍스트 MD + 코드 리뷰를 1회 LLM 호출로 동시 수행 (병렬 6) |
 | `.uasset` `.umap` 에셋 변경 | DataValidation 커맨드렛 실행 → 에셋 검증 리포트 |
+
+### 성능 최적화
+
+- **컨텍스트+리뷰 통합** — 1회 LLM 호출로 컨텍스트 MD 생성과 코드 리뷰를 동시 수행
+- **디렉토리(모듈) 단위 그룹핑** — 같은 폴더의 .h/.cpp를 합쳐 하나의 단위로 처리
+- **병렬 처리** — ThreadPoolExecutor 6워커 병렬 실행 (22개 파일 → 6모듈 → ~4분)
+- **모델 선택** — Sonnet(기본, 빠름) / Opus(정확) / Haiku(최고속) 중 선택
+- **stdin 프롬프트 전달** — Windows 명령줄 길이 제한(32KB) 회피
+
+### 컨텍스트 코멘트 시스템
+
+컨텍스트 MD 파일에 `## 코멘트` 섹션으로 개발자 노트를 기록할 수 있다.
+
+```markdown
+## 코멘트
+- [2026-03-29][방향] 비즈니스 로직 분리하여 재사용성 극대화 예정 (홍길동)
+- [2026-03-29][고민] 자식 클래스마다 다른 정보를 담아야 해서 구조 검토 중 (홍길동)
+- [2026-03-29][리뷰] 델리게이트 미정리는 선행작업이라 의도적 (홍길동)
+```
+
+| 태그 | 용도 |
+|------|------|
+| `[리뷰]` | 리뷰 지적에 대한 응답 |
+| `[방향]` | 설계 방향·목표 |
+| `[고민]` | 미결 설계 고민 |
+| `[진행]` | 방향 전환·진척 상황 |
+| `[메모]` | 기타 참고 사항 |
+
+- 코멘트는 벡터 임베딩에서 **제외** (검색 품질 유지)
+- 코드 리뷰 시 에이전트가 **참조** (인지된 항목 반복 지적 방지 + 설계 맥락 반영)
+- 컨텍스트 MD 재생성 시 코멘트 **자동 보존**
+- `11_리뷰상담` 에이전트를 통해 대화형으로 기록
 
 ---
 
@@ -171,7 +206,7 @@ dist/
 
 | 서버 | 주요 툴 | 사용 에이전트 |
 |------|---------|-------------|
-| `context_search` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 03, 05, 07, 08, 09, 10 |
+| `context_search` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 03, 05, 07, 08, 09, 10, 11 |
 | `log_analyzer` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |
@@ -188,6 +223,20 @@ dist/
 
 - Gemini CLI 미설치 환경에서는 안내 메시지를 반환하며 정상 종료
 - `config.json`의 `use_gemini: true` 설정 시 자동화 파이프라인도 Gemini로 전환
+
+---
+
+## 프로세스 안전장치
+
+| 종료 방식 | Job Object | SIGBREAK | atexit |
+|----------|-----------|---------|--------|
+| Ctrl+C | - | - | O |
+| CMD 창 X 버튼 | O | O | - |
+| 작업관리자 강제종료 | O | - | - |
+
+- **Windows Job Object** — watch.exe 종료 시 모든 자식/손자 프로세스(claude, MCP 서버) 자동 정리
+- **중복 실행 방지** — `_processing_lock`으로 이전 작업 진행 중에는 새 작업 시작하지 않음
+- **누적 커밋 처리** — 작업 중 추가 커밋이 쌓여도 diff 범위를 확장하여 누락 없이 처리
 
 ---
 

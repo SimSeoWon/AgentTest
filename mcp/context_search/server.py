@@ -488,10 +488,11 @@ if __name__ == "__main__":
     import sys
 
     # CLI 모드: watch.py에서 subprocess로 호출
-    #   --rebuild <project_root>                    전체 재구축
-    #   --upsert  <project_root> <md1> <md2> ...    증분 갱신
-    #   --status  <project_root>                    상태 확인
-    # (인수 없음)                                    MCP 서버 모드
+    #   --rebuild <project_root>                         전체 재구축
+    #   --upsert  <project_root> <md1> <md2> ...         증분 갱신
+    #   --status  <project_root>                         상태 확인
+    #   --search  <project_root> <query> [n_results]     통합 검색
+    # (인수 없음)                                         MCP 서버 모드
     if len(sys.argv) > 1 and sys.argv[1].startswith("--"):
         cmd = sys.argv[1]
         root = sys.argv[2] if len(sys.argv) > 2 else "."
@@ -502,6 +503,13 @@ if __name__ == "__main__":
             print(_upsert_files(root, files))
         elif cmd == "--status":
             print(index_status(root))
+        elif cmd == "--search":
+            query = sys.argv[3] if len(sys.argv) > 3 else ""
+            n = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+            if query:
+                print(combined_search(query, root, n_results=n))
+            else:
+                print(json.dumps({"error": "검색어가 필요합니다: --search <root> <query> [n]"}, ensure_ascii=False))
         else:
             print(json.dumps({"error": f"알 수 없는 명령: {cmd}"}, ensure_ascii=False))
     else:

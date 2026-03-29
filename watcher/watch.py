@@ -1,11 +1,16 @@
 import re
+import os
 import sys
 import json
 import time
+import atexit
+import signal
 import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from agent_templates import (
     AGENTS, ROLE_TEMPLATES, PROMPT_TEMPLATES,
@@ -18,6 +23,91 @@ CONFIG_FILE = "config.json"
 STATE_FILE = ".watch_state"
 TARGET_EXTENSIONS = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}
 ASSET_EXTENSIONS = {'.uasset', '.umap'}
+MAX_WORKERS = 6  # 병렬 LLM 호출 수
+_processing_lock = threading.Lock()  # 중복 실행 방지
+
+
+# ─────────────────────────────────────────
+# 프로세스 정리 (Windows)
+# ─────────────────────────────────────────
+
+def _setup_job_object():
+    """
+    Windows Job Object를 생성하여 현재 프로세스에 할당한다.
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 플래그로
+    watch.exe 종료 시 모든 자식/손자 프로세스(claude, MCP 서버)가 자동 정리된다.
+    """
+    if sys.platform != 'win32':
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        kernel32 = ctypes.windll.kernel32
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ('PerProcessUserTimeLimit', ctypes.c_longlong),
+                ('PerJobUserTimeLimit', ctypes.c_longlong),
+                ('LimitFlags', wt.DWORD),
+                ('MinimumWorkingSetSize', ctypes.c_size_t),
+                ('MaximumWorkingSetSize', ctypes.c_size_t),
+                ('ActiveProcessLimit', wt.DWORD),
+                ('Affinity', ctypes.c_size_t),
+                ('PriorityClass', wt.DWORD),
+                ('SchedulingClass', wt.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [(f'c{i}', ctypes.c_ulonglong) for i in range(6)]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ('IoInfo', IO_COUNTERS),
+                ('ProcessMemoryLimit', ctypes.c_size_t),
+                ('JobMemoryLimit', ctypes.c_size_t),
+                ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                ('PeakJobMemoryUsed', ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+        kernel32.SetInformationJobObject(
+            job, 9,  # JobObjectExtendedLimitInformation
+            ctypes.byref(info), ctypes.sizeof(info),
+        )
+        kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess())
+
+        return job  # 핸들을 유지해야 GC되지 않음
+    except Exception:
+        return None
+
+
+# MCP 프로세스명 목록 (Job Object 실패 시 폴백용)
+_MCP_PROCESS_NAMES = [
+    "context_search.exe", "log_analyzer.exe", "crash_analyzer.exe",
+    "commandlet_runner.exe", "gemini_query.exe",
+]
+
+
+def _kill_orphan_mcps():
+    """알려진 MCP 프로세스를 강제 종료한다 (Job Object 실패 시 폴백)."""
+    if sys.platform != 'win32':
+        return
+    for name in _MCP_PROCESS_NAMES:
+        os.system(f'taskkill /F /IM {name} >nul 2>&1')
+
+
+def _on_exit_signal(signum, frame):
+    """SIGBREAK(콘솔 창 닫기) 시 정리 후 종료."""
+    _kill_orphan_mcps()
+    sys.exit(0)
 
 
 def get_base_dir() -> Path:
@@ -88,12 +178,25 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     else:
         use_gemini = False
 
+    print("\nClaude 모델 선택 (자동 파이프라인용):")
+    print("  1. claude-sonnet-4-6  — 빠름, 대부분의 작업에 충분 (기본값)")
+    print("  2. claude-opus-4-6    — 느리지만 정확, 복잡한 코드 분석에 유리")
+    print("  3. claude-haiku-4-5   — 가장 빠름, 단순 작업용")
+    model_choice = input("선택 [1/2/3]: ").strip()
+    if model_choice == "2":
+        claude_model = "claude-opus-4-6"
+    elif model_choice == "3":
+        claude_model = "claude-haiku-4-5"
+    else:
+        claude_model = "claude-sonnet-4-6"
+
     config = {
         "branch": branch,
         "poll_interval": poll_interval,
         "auto_review": auto_review,
         "auto_asset_validation": auto_asset_validation,
         "use_gemini": use_gemini,
+        "claude_model": claude_model,
         "repo_dir": str(repo_dir),
     }
 
@@ -363,12 +466,20 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
         return
 
     if changed_files:
-        # 변경된 소스 파일에 대응하는 MD 파일 경로 수집
-        md_paths = []
+        # 변경된 소스 파일의 디렉토리 → 디렉토리 단위 MD 경로 수집 (중복 제거)
+        md_set: set[str] = set()
         for f in changed_files:
-            md_path = context_dir / Path(f).with_suffix('.md')
-            if md_path.exists():
-                md_paths.append(str(md_path.relative_to(context_dir)).replace("\\", "/"))
+            if Path(f).suffix not in TARGET_EXTENSIONS:
+                continue
+            # 디렉토리 단위 MD: Source/Module/SubDir.md
+            dir_md = context_dir / (str(Path(f).parent) + ".md")
+            if dir_md.exists():
+                md_set.add(str(dir_md.relative_to(context_dir)).replace("\\", "/"))
+            # 하위 호환: 기존 클래스 단위 MD도 체크
+            file_md = context_dir / Path(f).with_suffix('.md')
+            if file_md.exists():
+                md_set.add(str(file_md.relative_to(context_dir)).replace("\\", "/"))
+        md_paths = sorted(md_set)
         if not md_paths:
             return
         cmd = cmd_base + ["--upsert", str(base_dir)] + md_paths
@@ -394,6 +505,29 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
         log(f"[경고] 벡터 인덱싱 오류: {e}")
 
 
+def search_related_contexts(base_dir: Path, query: str, n_results: int = 3) -> list[dict]:
+    """
+    context_search.exe --search를 호출하여 관련 컨텍스트를 검색한다.
+    반환: [{"file": ..., "content_preview": ..., "tags": [...], ...}, ...]
+    """
+    cmd_base = _get_context_search_cmd(base_dir)
+    if not cmd_base:
+        return []
+
+    cmd = cmd_base + ["--search", str(base_dir), query, str(n_results)]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding='utf-8', errors='replace', timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            return data.get("results", [])
+    except Exception:
+        pass
+    return []
+
+
 # ─────────────────────────────────────────
 # 컨텍스트 갱신
 # ─────────────────────────────────────────
@@ -404,176 +538,284 @@ def _extract_comments_section(md_content: str) -> str:
     return match.group(1).rstrip() if match else ""
 
 
-def update_context(repo_dir: Path, context_dir: Path, changed_files: list[str]):
+HEADER_EXTENSIONS = {'.h', '.hpp', '.inl'}
+
+# 디렉토리당 최대 프롬프트 크기 (클래스 여러 개를 한번에 분석하므로 넉넉하게)
+GROUP_CONTENT_LIMIT = 8000
+
+
+def _group_by_directory(changed_files: list[str], repo_dir: Path) -> dict[str, list[str]]:
+    """
+    변경 파일을 부모 디렉토리(모듈) 단위로 묶는다.
+    키: 부모 디렉토리 상대경로 (예: Source/ModularStage/Mission/TaskSystem)
+    값: 해당 디렉토리의 파일 경로 목록
+    """
+    groups: dict[str, list[str]] = {}
     for file_path in changed_files:
         full_path = repo_dir / file_path
         if not full_path.exists() or full_path.suffix not in TARGET_EXTENSIONS:
             continue
+        dir_key = str(Path(file_path).parent)
+        groups.setdefault(dir_key, []).append(file_path)
+    return groups
 
-        try:
-            content = full_path.read_text(encoding='utf-8', errors='ignore')
-        except Exception as e:
-            print(f"[경고] 파일 읽기 실패 ({file_path}): {e}")
+
+def _build_related_context(base_dir: Path, file_path: str, context: str) -> str:
+    """
+    파일의 컨텍스트 요약을 검색 쿼리로 사용하여 관련 파일 컨텍스트를 수집한다.
+    반환: 관련 컨텍스트 문자열 (없으면 빈 문자열)
+    """
+    query = Path(file_path).stem
+    if context:
+        body = re.sub(r'^---\s*\n.*?\n---\s*\n', '', context, count=1, flags=re.DOTALL).strip()
+        query += " " + body[:200]
+
+    results = search_related_contexts(base_dir, query, n_results=3)
+    if not results:
+        return ""
+
+    file_stem = Path(file_path).with_suffix('.md').name
+    related = []
+    for r in results:
+        if file_stem in r.get("file", ""):
             continue
+        preview = r.get("content_preview", "")[:400]
+        if preview:
+            related.append(f"[{r.get('file', '?')}]\n{preview}")
 
-        prompt = PROMPT_TEMPLATES["01_소스분석"].format(
-            file_path=file_path,
-            content=content[:4000],
-        )
-
-        result = _call_claude(prompt)
-        if result is None:
-            continue
-
-        out_path = context_dir / Path(file_path).with_suffix('.md')
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # 기존 MD 파일에 ## 코멘트 섹션이 있으면 보존
-        existing_comments = ""
-        if out_path.exists():
-            try:
-                existing_comments = _extract_comments_section(
-                    out_path.read_text(encoding='utf-8')
-                )
-            except Exception:
-                pass
-
-        if existing_comments:
-            # 새 MD에 혹시 ## 코멘트가 포함됐으면 제거 후 기존 코멘트 재부착
-            result = re.sub(r'## 코멘트\s*\n.*', '', result, flags=re.DOTALL).rstrip()
-            result = result + "\n\n" + existing_comments + "\n"
-
-        out_path.write_text(result, encoding='utf-8')
-        print(f"  [컨텍스트] {out_path.relative_to(context_dir.parent.parent)}")
+    return "\n\n".join(related) if related else ""
 
 
-# ─────────────────────────────────────────
-# 코드 리뷰
-# ─────────────────────────────────────────
+def _process_directory_group(
+    repo_dir: Path, context_dir: Path, base_dir: Path,
+    dir_key: str, file_paths: list[str],
+    auto_review: bool, use_gemini: bool,
+) -> dict:
+    """
+    디렉토리(모듈) 단위로 컨텍스트 MD 생성 + 코드 리뷰를 한 번의 LLM 호출로 수행한다.
+    반환: {"context_msg": ..., "review": ...} or partial
+    """
+    file_paths.sort(key=lambda f: (
+        0 if Path(f).suffix in HEADER_EXTENSIONS else 1,
+        Path(f).name,
+    ))
 
-def run_code_review(
-    repo_dir: Path,
-    context_dir: Path,
-    reviews_dir: Path,
-    changed_files: list[str],
-    commit_hash: str,
-    use_gemini: bool = False,
-):
-    """변경된 파일에 대해 코드 리뷰를 실행하고 .claude/reviews/ 에 저장한다."""
-    reviewable = [
-        f for f in changed_files
-        if (repo_dir / f).exists() and Path(f).suffix in TARGET_EXTENSIONS
-    ]
-
-    if not reviewable:
-        log("리뷰 대상 파일 없음 — 건너뜀")
-        return
-
-    log(f"코드 리뷰 시작 — {len(reviewable)}개 파일")
-
-    file_reviews: list[dict] = []
-
-    for file_path in reviewable:
-        full_path = repo_dir / file_path
+    combined_content = ""
+    included_paths = []
+    for fp in file_paths:
         try:
-            content = full_path.read_text(encoding='utf-8', errors='ignore')[:4000]
+            text = (repo_dir / fp).read_text(encoding='utf-8', errors='ignore')
         except Exception:
             continue
+        included_paths.append(fp)
+        combined_content += f"// ── {fp} ──\n{text}\n\n"
 
-        # 해당 파일의 컨텍스트 MD 로드 (없으면 빈 문자열)
-        context_md = context_dir / Path(file_path).with_suffix('.md')
-        context = context_md.read_text(encoding='utf-8') if context_md.exists() else ""
+    if not included_paths:
+        return {}
 
-        # 기존 코멘트 추출 — 개발자가 "의도적" 등으로 표기한 항목은 리뷰에서 참조
-        dev_comments = _extract_comments_section(context) if context else ""
-        comments_notice = ""
-        if dev_comments:
-            comments_notice = (
-                f"\n\n[개발자 코멘트 — 아래 항목은 이미 인지된 사항이므로 동일 지적을 생략하거나 "
-                f"'인지됨'으로 표기해줘]\n{dev_comments}\n"
+    # 기존 코멘트 보존
+    out_path = context_dir / (dir_key + ".md")
+    existing_comments = ""
+    if out_path.exists():
+        try:
+            existing_comments = _extract_comments_section(
+                out_path.read_text(encoding='utf-8')
             )
+        except Exception:
+            pass
 
-        print(f"  [리뷰] {file_path}")
+    # 관련 컨텍스트 검색 (기존 벡터 인덱스 활용)
+    existing_context = ""
+    if out_path.exists():
+        try:
+            existing_context = out_path.read_text(encoding='utf-8')
+        except Exception:
+            pass
 
-        convention = _call_llm(
-            f"아래 코드가 UE5 팀 코딩 컨벤션을 준수하는지 검토해줘.\n"
+    related = _build_related_context(base_dir, included_paths[0], existing_context)
+    related_notice = ""
+    if related:
+        related_notice = f"\n\n[관련 파일 컨텍스트 — 의존 관계와 연동 로직 참고]\n{related}\n"
+
+    dev_comments = _extract_comments_section(existing_context) if existing_context else ""
+    comments_notice = ""
+    if dev_comments:
+        comments_notice = (
+            f"\n\n[개발자 코멘트 — 아래 항목은 이미 인지된 사항이므로 동일 지적을 생략하거나 "
+            f"'인지됨'으로 표기해줘]\n{dev_comments}\n"
+        )
+
+    # ── 프롬프트 구성: 컨텍스트 MD + 코드 리뷰를 한번에 ──
+    file_path_str = " + ".join(included_paths)
+    code_block = combined_content[:GROUP_CONTENT_LIMIT]
+
+    if auto_review:
+        prompt = (
+            f"아래 코드 파일들을 분석하여 두 가지 작업을 수행해줘.\n"
+            f"반드시 === 구분자로 두 섹션을 나눠줘.\n\n"
+            f"=== CONTEXT_MD ===\n"
+            f"RAG 컨텍스트 MD를 생성해줘. 반드시 아래 형식을 지켜:\n"
+            f"---\n"
+            f"tags: [태그1, 태그2, ...]\n"
+            f"category: 대분류/중분류/소분류\n"
+            f"related_classes:\n"
+            f"  - ClassName: file_path\n"
+            f"---\n\n"
+            f"## 요약\n(기능과 역할 요약)\n\n"
+            f"## 개선 필요 사항\n(알려진 이슈, 기술 부채. 없으면 \"없음\")\n\n"
+            f"주의: \"## 코멘트\" 섹션은 절대 생성하지 마.\n\n"
+            f"=== CODE_REVIEW ===\n"
+            f"같은 모듈의 파일들이므로 클래스 간 의존 관계, 인터페이스 일관성도 함께 확인해줘.\n\n"
+            f"## 1. 코딩 컨벤션 검토\n"
             f"검토 기준: 클래스명 파스칼케이스, 함수명 파스칼케이스, "
             f"멤버변수 접두사(b/f/i), public 함수 주석 필수.\n"
-            f"결과를 표로 정리해줘: | 항목 | 위반 내용 | 라인 | 심각도 |"
-            f"{comments_notice}\n\n"
-            f"파일: {file_path}\n```\n{content}\n```",
-            use_gemini=use_gemini,
+            f"결과: | 파일 | 항목 | 위반 내용 | 라인 | 심각도 |\n\n"
+            f"## 2. 버그·안전성 검토\n"
+            f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토.\n"
+            f"결과: | 파일 | 위험도 | 라인 | 설명 | 권장 수정 |"
+            f"{comments_notice}"
+            f"{related_notice}\n\n"
+            f"파일 경로: {file_path_str}\n"
+            f"```\n{code_block}\n```"
+        )
+    else:
+        prompt = PROMPT_TEMPLATES["01_소스분석"].format(
+            file_path=file_path_str,
+            content=code_block,
         )
 
-        validation = _call_llm(
-            f"아래 코드에서 잠재적 버그와 안전성 이슈를 찾아줘.\n"
-            f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토해줘.\n"
-            f"형식: | 위험도 | 라인 | 설명 | 권장 수정 |"
-            f"{comments_notice}\n\n"
-            f"관련 컨텍스트:\n{context[:1000]}\n\n"
-            f"파일: {file_path}\n```\n{content}\n```",
-            use_gemini=use_gemini,
-        )
+    dir_name = Path(dir_key).name
+    file_list = ", ".join(Path(f).name for f in included_paths)
+    print(f"  [분석] {dir_name}/ ({len(included_paths)}개: {file_list})")
 
-        file_reviews.append({
-            "file": file_path,
-            "convention": convention or "분석 실패",
-            "validation": validation or "분석 실패",
-        })
+    raw = _call_llm(prompt, use_gemini=use_gemini)
+    if raw is None:
+        return {}
 
-    if not file_reviews:
+    result = {}
+
+    # ── 응답 파싱: CONTEXT_MD / CODE_REVIEW 분리 ──
+    if auto_review and "=== CODE_REVIEW ===" in raw:
+        parts = raw.split("=== CODE_REVIEW ===", 1)
+        context_md = parts[0].replace("=== CONTEXT_MD ===", "").strip()
+        review_text = parts[1].strip()
+        result["review"] = {"file": dir_key, "review": review_text}
+    elif auto_review and "=== CONTEXT_MD ===" in raw:
+        # CODE_REVIEW 마커 없이 CONTEXT_MD만 있는 경우
+        context_md = raw.replace("=== CONTEXT_MD ===", "").strip()
+    else:
+        context_md = raw.strip()
+
+    # ── 컨텍스트 MD 저장 ──
+    if existing_comments:
+        context_md = re.sub(r'## 코멘트\s*\n.*', '', context_md, flags=re.DOTALL).rstrip()
+        context_md = context_md + "\n\n" + existing_comments + "\n"
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(context_md, encoding='utf-8')
+    result["context_msg"] = f"  [분석] {out_path.relative_to(context_dir.parent.parent)} ({len(included_paths)}개 파일)"
+
+    return result
+
+
+def process_commit(
+    repo_dir: Path, context_dir: Path, reviews_dir: Path,
+    changed_files: list[str], commit_hash: str,
+    auto_review: bool = True, use_gemini: bool = False,
+):
+    """
+    컨텍스트 생성 + 코드 리뷰를 디렉토리(모듈) 단위로 한 번에 처리한다.
+    LLM 1회 호출로 두 작업을 동시 수행하여 시간을 절반으로 줄인다.
+    """
+    base_dir = context_dir.parent.parent
+    groups = _group_by_directory(changed_files, repo_dir)
+    if not groups:
+        log("소스 파일 없음 — 건너뜀")
         return
 
-    # 07_코드매니저로 통합 리포트 생성
-    log("통합 리포트 생성 중...")
-    report = _build_review_report(file_reviews, commit_hash, use_gemini=use_gemini)
+    total_files = sum(len(fps) for fps in groups.values())
+    mode = "컨텍스트+리뷰" if auto_review else "컨텍스트"
+    log(f"{mode} 시작 — {total_files}개 파일, {len(groups)}개 모듈 (병렬 {MAX_WORKERS})")
 
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-    report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}.md"
-    report_path.write_text(report, encoding='utf-8')
-    log(f"코드 리뷰 완료 → {report_path.relative_to(reviews_dir.parent.parent)}")
+    all_reviews: list[dict] = []
+    success, fail = 0, 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _process_directory_group,
+                repo_dir, context_dir, base_dir, dk, fps, auto_review, use_gemini,
+            ): dk
+            for dk, fps in groups.items()
+        }
+        for future in as_completed(futures):
+            dk = futures[future]
+            try:
+                result = future.result()
+                if result.get("context_msg"):
+                    print(result["context_msg"])
+                    success += 1
+                else:
+                    fail += 1
+                if result.get("review"):
+                    all_reviews.append(result["review"])
+            except Exception as e:
+                log(f"[경고] 처리 실패 ({dk}): {e}")
+                fail += 1
+
+    if fail:
+        log(f"처리: {success}개 성공, {fail}개 실패")
+
+    # 벡터 인덱스 갱신
+    log("벡터 인덱스 갱신 중...")
+    update_vector_index(context_dir, base_dir, changed_files)
+    log("벡터 인덱스 갱신 완료")
+
+    # 리뷰 리포트 저장
+    if all_reviews:
+        report = _build_review_report(all_reviews, commit_hash)
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
+        report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}.md"
+        report_path.write_text(report, encoding='utf-8')
+        log(f"코드 리뷰 완료 → {report_path.relative_to(reviews_dir.parent.parent)}")
 
 
-def _build_review_report(file_reviews: list[dict], commit_hash: str, use_gemini: bool = False) -> str:
-    """07_코드매니저 프롬프트로 통합 리포트를 생성한다."""
-    files_summary = "\n\n".join(
-        f"### {r['file']}\n"
-        f"**규약 검토**\n{r['convention']}\n\n"
-        f"**코드 검증**\n{r['validation']}"
+def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
+    """모듈별 리뷰 결과를 직접 취합하여 통합 리포트를 생성한다. (LLM 호출 없음)"""
+    file_reviews.sort(key=lambda r: r["file"])
+
+    modules_section = "\n\n---\n\n".join(
+        f"### {Path(r['file']).name}/\n{r['review']}"
         for r in file_reviews
     )
 
-    prompt = (
-        f"아래 에이전트 리포트들을 통합하여 최종 코드 리뷰 리포트를 작성해줘.\n\n"
-        f"커밋: {commit_hash}\n"
-        f"검토 파일 수: {len(file_reviews)}개\n\n"
-        f"{files_summary}\n\n"
-        f"최종 리포트 형식:\n"
-        f"## 요약\n"
-        f"## 즉시 수정 필요 (Critical)\n"
-        f"## 권장 수정 (Warning)\n"
-        f"## 참고 사항 (Info)\n"
-        f"## 액션 아이템"
-    )
-
-    result = _call_llm(prompt, use_gemini=use_gemini)
-    if result:
-        return f"# 코드 리뷰 리포트\n\n커밋: `{commit_hash}`  \n생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n{result}"
-
-    # Claude 호출 실패 시 원본 취합본 반환
     return (
         f"# 코드 리뷰 리포트\n\n"
         f"커밋: `{commit_hash}`  \n"
-        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"{files_summary}"
+        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n"
+        f"검토 모듈: {len(file_reviews)}개\n\n"
+        f"---\n\n"
+        f"{modules_section}"
     )
 
 
+# 기본 모델 (config.json의 claude_model로 오버라이드 가능)
+_claude_model: str = "claude-sonnet-4-6"
+
+
+def set_claude_model(model: str):
+    global _claude_model
+    _claude_model = model
+
+
 def _call_claude(prompt: str) -> str | None:
-    """Claude CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None."""
+    """Claude CLI를 호출하고 결과 텍스트를 반환한다. stdin으로 프롬프트 전달 (Windows 명령줄 길이 제한 회피)."""
+    cmd = ["claude", "-p", "--dangerously-skip-permissions"]
+    if _claude_model:
+        cmd.extend(["--model", _claude_model])
     result = subprocess.run(
-        ["claude", "-p", prompt, "--dangerously-skip-permissions"],
-        capture_output=True, text=True, encoding='utf-8'
+        cmd, input=prompt,
+        capture_output=True, text=True, encoding='utf-8',
     )
     if result.returncode != 0:
         print(f"[오류] Claude 호출 실패: {result.stderr[:200]}")
@@ -749,6 +991,12 @@ def log(msg: str):
 # ─────────────────────────────────────────
 
 def main():
+    # 프로세스 정리 설정: Job Object (1차) + atexit/signal (폴백)
+    _job = _setup_job_object()
+    atexit.register(_kill_orphan_mcps)
+    if sys.platform == 'win32':
+        signal.signal(signal.SIGBREAK, _on_exit_signal)
+
     base_dir = get_base_dir()
 
     print("=" * 50)
@@ -770,9 +1018,13 @@ def main():
     auto_asset_validation = config.get("auto_asset_validation", True)
     use_gemini = config.get("use_gemini", False) and bool(shutil.which("gemini"))
 
+    # Claude 모델 설정 (기본값: sonnet — 속도와 품질의 균형)
+    claude_model = config.get("claude_model", "claude-sonnet-4-6")
+    set_claude_model(claude_model)
+
     context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
-    llm_label = "Gemini" if use_gemini else "Claude"
+    llm_label = "Gemini" if use_gemini else f"Claude ({claude_model.split('-')[1]})"
     vector_ok = bool(_get_context_search_cmd(base_dir))
     vector_label = "ON" if vector_ok else "OFF (context_search 없음)"
     log(
@@ -805,28 +1057,35 @@ def main():
                 remote_hash = get_remote_hash(repo_dir, branch)
 
                 if remote_hash and remote_hash != last_hash:
-                    log(f"새 커밋 감지: {last_hash[:8]} → {remote_hash[:8]}")
+                    # 중복 실행 방지: 이전 작업이 아직 진행 중이면 건너뜀
+                    if not _processing_lock.acquire(blocking=False):
+                        log(f"[대기] 이전 작업 진행 중 — 다음 폴링에서 처리 ({remote_hash[:8]})")
+                    else:
+                        try:
+                            log(f"새 커밋 감지: {last_hash[:8]} → {remote_hash[:8]}")
 
-                    if git_pull(repo_dir, branch):
-                        changed_files = get_changed_files(repo_dir, last_hash, remote_hash)
-                        log(f"변경된 파일 {len(changed_files)}개")
+                            if git_pull(repo_dir, branch):
+                                # pull 후 실제 최신 해시 재확인 (작업 중 추가 커밋 대응)
+                                actual_hash = get_local_hash(repo_dir)
+                                if actual_hash != remote_hash:
+                                    log(f"추가 커밋 포함: {remote_hash[:8]} → {actual_hash[:8]}")
 
-                        log("컨텍스트 갱신 중...")
-                        update_context(repo_dir, context_dir, changed_files)
-                        log("컨텍스트 갱신 완료")
+                                changed_files = get_changed_files(repo_dir, last_hash, actual_hash)
+                                log(f"변경된 파일 {len(changed_files)}개")
 
-                        log("벡터 인덱스 갱신 중...")
-                        update_vector_index(context_dir, base_dir, changed_files)
-                        log("벡터 인덱스 갱신 완료")
+                                process_commit(
+                                    repo_dir, context_dir, reviews_dir,
+                                    changed_files, actual_hash,
+                                    auto_review=auto_review, use_gemini=use_gemini,
+                                )
 
-                        if auto_review:
-                            run_code_review(repo_dir, context_dir, reviews_dir, changed_files, remote_hash, use_gemini=use_gemini)
+                                if auto_asset_validation:
+                                    run_asset_validation(base_dir, reviews_dir, changed_files, actual_hash, use_gemini=use_gemini)
 
-                        if auto_asset_validation:
-                            run_asset_validation(base_dir, reviews_dir, changed_files, remote_hash, use_gemini=use_gemini)
-
-                        last_hash = remote_hash
-                        save_state(base_dir, last_hash)
+                                last_hash = actual_hash
+                                save_state(base_dir, last_hash)
+                        finally:
+                            _processing_lock.release()
                 else:
                     print(
                         f"\r[{datetime.now().strftime('%H:%M:%S')}] 대기 중... "

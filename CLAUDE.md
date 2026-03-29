@@ -137,18 +137,25 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 
 **감시 루프**
 - `git fetch` → remote 해시와 local 해시 비교
-- 변경 감지 시: `git pull` → `git diff --name-only` → 아래 네 작업 순차 실행
-  1. **컨텍스트 갱신** (`update_context`) — `01_소스분석` 프롬프트로 MD 생성 → `context/`
+- 변경 감지 시: `git pull` → `git diff --name-only` → `process_commit()` 실행
+  1. **컨텍스트+리뷰 통합 처리** (`process_commit`) — 변경 파일을 **디렉토리(모듈) 단위**로 묶어 **1회의 LLM 호출**로 컨텍스트 MD 생성 + 코드 리뷰를 동시 수행 (병렬 6워커)
+     - 같은 디렉토리의 `.h`/`.cpp` 파일을 합쳐서 하나의 MD로 생성 (예: `TaskSystem.md`)
+     - `.h`를 먼저, `.cpp`를 뒤에 배치하여 인터페이스→구현 순서로 분석
+     - 그룹당 최대 8000자 (`GROUP_CONTENT_LIMIT`)
+     - `auto_review: false` 시 컨텍스트 MD만 생성
+     - LLM 응답을 `=== CONTEXT_MD ===` / `=== CODE_REVIEW ===` 구분자로 파싱하여 분리 저장
   2. **벡터 인덱싱** (`update_vector_index`) — 생성된 MD를 ChromaDB에 upsert → `vector_db/`
-  3. **코드 리뷰** (`run_code_review`) — `auto_review: true` 시에만 실행 → `reviews/`
-  4. **에셋 검증** (`run_asset_validation`) — `auto_asset_validation: true` 시에만 실행 → `reviews/`
+  3. **에셋 검증** (`run_asset_validation`) — `auto_asset_validation: true` 시에만 실행 → `reviews/`
+- stdin으로 프롬프트 전달 (Windows 명령줄 길이 제한 회피)
 - 소스 대상 확장자: `.cpp`, `.h`, `.hpp`, `.inl`, `.cs`, `.py`
 - 에셋 대상 확장자: `.uasset`, `.umap`
 - `.watch_state` 파일로 마지막 커밋 해시 영속 저장 (멱등성 보장)
 
-**코드 리뷰 흐름 (`run_code_review`)**
-- 파일별: `03_코드규약` + `05_코드검증` 각각 Claude CLI 호출
-- 전체 취합: `07_코드매니저` 프롬프트로 통합 리포트 생성
+**코드 리뷰 흐름 (컨텍스트 생성과 통합)**
+- 컨텍스트 MD 생성과 코드 리뷰를 **1회의 LLM 호출**로 동시 수행
+- **관련 컨텍스트 자동 검색**: 모듈별로 `context_search.exe --search`를 호출하여 관련 파일 컨텍스트 3개를 수집, 프롬프트에 주입
+- **개발자 코멘트 참조**: 컨텍스트 MD의 `## 코멘트` 섹션이 있으면 "인지된 항목"으로 프롬프트에 주입하여 반복 지적 방지
+- 통합 리포트: 모듈별 리뷰 결과를 직접 취합 (추가 LLM 호출 없음)
 - 저장: `.claude/reviews/YYYY-MM-DD_HHMM_<커밋해시>.md`
 - `config.json`의 `auto_review: false` 로 비활성화 가능
 
@@ -161,9 +168,10 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 
 **Claude CLI 호출 방식**
 ```
-claude -p "[프롬프트]" --dangerously-skip-permissions
+claude -p --dangerously-skip-permissions --model <claude_model>
 ```
-→ `01_소스분석`의 `PROMPT_TEMPLATES`를 사용하여 프롬프트 생성
+→ stdin으로 프롬프트 전달 (Windows 명령줄 길이 제한 회피)
+→ `config.json`의 `claude_model`로 모델 지정 (기본값: `claude-sonnet-4-6`)
 
 ### 2. `watcher/agent_templates.py`
 
@@ -294,6 +302,7 @@ watch.exe → context MD 생성 → context_search.exe --upsert 호출 → Chrom
 context_search.exe --rebuild <project_root>                   전체 재구축
 context_search.exe --upsert  <project_root> <md1> <md2> ...  증분 갱신
 context_search.exe --status  <project_root>                   상태 확인
+context_search.exe --search  <project_root> <query> [n]       통합 검색 (자동 리뷰용)
 context_search.exe                                            MCP 서버 모드 (기본)
 ```
 
