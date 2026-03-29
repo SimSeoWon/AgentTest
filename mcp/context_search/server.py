@@ -84,6 +84,11 @@ def _extract_body(content: str) -> str:
     return re.sub(r'^---\s*\n.*?\n---\s*\n', '', content, count=1, flags=re.DOTALL).strip()
 
 
+def _strip_comments_section(body: str) -> str:
+    """## 코멘트 섹션을 제거한다 (벡터 임베딩용). 코멘트는 검색 품질에 영향을 주지 않도록 제외."""
+    return re.sub(r'## 코멘트\s*\n.*', '', body, flags=re.DOTALL).strip()
+
+
 # ─────────────────────────────────────────
 # 벡터 DB 헬퍼
 # ─────────────────────────────────────────
@@ -375,7 +380,7 @@ def rebuild_index(project_root: str = ".") -> str:
             continue
 
         meta = _parse_frontmatter(content)
-        body = _extract_body(content)
+        body = _strip_comments_section(_extract_body(content))
         if not body.strip():
             continue
 
@@ -463,7 +468,7 @@ def _upsert_files(project_root: str, md_relative_paths: list[str]) -> str:
         except Exception:
             continue
         meta = _parse_frontmatter(content)
-        body = _extract_body(content)
+        body = _strip_comments_section(_extract_body(content))
         if not body.strip():
             continue
         ids.append(rel_path.replace("\\", "/"))

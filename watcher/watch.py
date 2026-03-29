@@ -398,6 +398,12 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
 # 컨텍스트 갱신
 # ─────────────────────────────────────────
 
+def _extract_comments_section(md_content: str) -> str:
+    """MD 파일에서 ## 코멘트 섹션을 추출한다. 없으면 빈 문자열 반환."""
+    match = re.search(r'(## 코멘트\s*\n.*)', md_content, re.DOTALL)
+    return match.group(1).rstrip() if match else ""
+
+
 def update_context(repo_dir: Path, context_dir: Path, changed_files: list[str]):
     for file_path in changed_files:
         full_path = repo_dir / file_path
@@ -421,6 +427,22 @@ def update_context(repo_dir: Path, context_dir: Path, changed_files: list[str]):
 
         out_path = context_dir / Path(file_path).with_suffix('.md')
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # 기존 MD 파일에 ## 코멘트 섹션이 있으면 보존
+        existing_comments = ""
+        if out_path.exists():
+            try:
+                existing_comments = _extract_comments_section(
+                    out_path.read_text(encoding='utf-8')
+                )
+            except Exception:
+                pass
+
+        if existing_comments:
+            # 새 MD에 혹시 ## 코멘트가 포함됐으면 제거 후 기존 코멘트 재부착
+            result = re.sub(r'## 코멘트\s*\n.*', '', result, flags=re.DOTALL).rstrip()
+            result = result + "\n\n" + existing_comments + "\n"
+
         out_path.write_text(result, encoding='utf-8')
         print(f"  [컨텍스트] {out_path.relative_to(context_dir.parent.parent)}")
 
@@ -462,13 +484,23 @@ def run_code_review(
         context_md = context_dir / Path(file_path).with_suffix('.md')
         context = context_md.read_text(encoding='utf-8') if context_md.exists() else ""
 
+        # 기존 코멘트 추출 — 개발자가 "의도적" 등으로 표기한 항목은 리뷰에서 참조
+        dev_comments = _extract_comments_section(context) if context else ""
+        comments_notice = ""
+        if dev_comments:
+            comments_notice = (
+                f"\n\n[개발자 코멘트 — 아래 항목은 이미 인지된 사항이므로 동일 지적을 생략하거나 "
+                f"'인지됨'으로 표기해줘]\n{dev_comments}\n"
+            )
+
         print(f"  [리뷰] {file_path}")
 
         convention = _call_llm(
             f"아래 코드가 UE5 팀 코딩 컨벤션을 준수하는지 검토해줘.\n"
             f"검토 기준: 클래스명 파스칼케이스, 함수명 파스칼케이스, "
             f"멤버변수 접두사(b/f/i), public 함수 주석 필수.\n"
-            f"결과를 표로 정리해줘: | 항목 | 위반 내용 | 라인 | 심각도 |\n\n"
+            f"결과를 표로 정리해줘: | 항목 | 위반 내용 | 라인 | 심각도 |"
+            f"{comments_notice}\n\n"
             f"파일: {file_path}\n```\n{content}\n```",
             use_gemini=use_gemini,
         )
@@ -476,7 +508,8 @@ def run_code_review(
         validation = _call_llm(
             f"아래 코드에서 잠재적 버그와 안전성 이슈를 찾아줘.\n"
             f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토해줘.\n"
-            f"형식: | 위험도 | 라인 | 설명 | 권장 수정 |\n\n"
+            f"형식: | 위험도 | 라인 | 설명 | 권장 수정 |"
+            f"{comments_notice}\n\n"
             f"관련 컨텍스트:\n{context[:1000]}\n\n"
             f"파일: {file_path}\n```\n{content}\n```",
             use_gemini=use_gemini,
