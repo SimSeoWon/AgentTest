@@ -5,7 +5,7 @@ echo ===================================
 echo  AgentTest - Full Build
 echo ===================================
 
-pip install pyinstaller mcp chromadb >nul 2>&1
+pip install pyinstaller mcp chromadb fastapi uvicorn >nul 2>&1
 
 echo.
 echo [1/6] Building watch.exe ...
@@ -26,6 +26,12 @@ pyinstaller -y ^
     --collect-all chromadb ^
     --collect-all onnxruntime ^
     --hidden-import=tokenizers ^
+    --hidden-import=fastapi ^
+    --hidden-import=uvicorn ^
+    --hidden-import=uvicorn.logging ^
+    --hidden-import=uvicorn.loops.auto ^
+    --hidden-import=uvicorn.protocols.http.auto ^
+    --hidden-import=uvicorn.lifespan.on ^
     mcp/context_search/server.py
 
 echo.

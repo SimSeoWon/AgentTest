@@ -26,6 +26,42 @@ ASSET_EXTENSIONS = {'.uasset', '.umap'}
 MAX_WORKERS = 6  # 병렬 LLM 호출 수
 _processing_lock = threading.Lock()  # 중복 실행 방지
 
+# 서버 모드 상태
+_server_mode = False
+_server_url = ""   # 예: "http://localhost:8100"
+_server_proc = None  # context_search --serve 프로세스
+
+
+def _http_post(endpoint: str, payload: dict, timeout: int = 120) -> dict | None:
+    """HTTP POST 요청. 서버 모드에서 인덱싱/검색에 사용."""
+    import urllib.request
+    import urllib.error
+    url = f"{_server_url.rstrip('/')}{endpoint}"
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log(f"[경고] HTTP 요청 실패 ({endpoint}): {e}")
+        return None
+
+
+def _http_get(endpoint: str, timeout: int = 30) -> dict | None:
+    """HTTP GET 요청. 서버 모드에서 상태 확인에 사용."""
+    import urllib.request
+    import urllib.error
+    url = f"{_server_url.rstrip('/')}{endpoint}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        log(f"[경고] HTTP 요청 실패 ({endpoint}): {e}")
+        return None
+
 
 # ─────────────────────────────────────────
 # 프로세스 정리 (Windows)
@@ -98,6 +134,18 @@ _MCP_PROCESS_NAMES = [
 
 def _kill_orphan_mcps():
     """알려진 MCP 프로세스를 강제 종료한다 (Job Object 실패 시 폴백)."""
+    # 서버 프로세스 정리
+    global _server_proc
+    if _server_proc is not None:
+        try:
+            _server_proc.terminate()
+            _server_proc.wait(timeout=5)
+        except Exception:
+            try:
+                _server_proc.kill()
+            except Exception:
+                pass
+        _server_proc = None
     if sys.platform != 'win32':
         return
     for name in _MCP_PROCESS_NAMES:
@@ -190,6 +238,21 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     else:
         claude_model = "claude-sonnet-4-6"
 
+    print("\n서버 모드 설정:")
+    print("  공용 PC에서 RAG 서버를 운영하려면 y를 선택하세요.")
+    server_mode_raw = input("서버 모드 활성화 (기본값: n) [y/n]: ").strip().lower()
+    server_mode = server_mode_raw == 'y'
+
+    server_port = 8100
+    server_host = "0.0.0.0"
+    context_server_url = ""
+    if server_mode:
+        port_raw = input("HTTP 서버 포트 (기본값: 8100): ").strip()
+        server_port = int(port_raw) if port_raw.isdigit() else 8100
+    else:
+        url_raw = input("원격 RAG 서버 URL (없으면 Enter, 예: http://192.168.1.100:8100): ").strip()
+        context_server_url = url_raw
+
     config = {
         "branch": branch,
         "poll_interval": poll_interval,
@@ -197,6 +260,10 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
         "auto_asset_validation": auto_asset_validation,
         "use_gemini": use_gemini,
         "claude_model": claude_model,
+        "server_mode": server_mode,
+        "server_host": server_host,
+        "server_port": server_port,
+        "context_server_url": context_server_url,
         "repo_dir": str(repo_dir),
     }
 
@@ -457,9 +524,39 @@ def _get_context_search_cmd(base_dir: Path) -> list[str]:
 
 def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[str] | None = None):
     """
-    context_search.exe를 CLI 모드로 호출하여 벡터 인덱싱을 수행한다.
+    벡터 인덱싱을 수행한다.
+    서버 모드: HTTP API로 요청, 로컬 모드: context_search.exe CLI 호출.
     changed_files 지정 시 해당 파일의 MD만 upsert, 미지정 시 전체 rebuild.
     """
+    # ── 서버 모드: HTTP API 사용 ──
+    if _server_mode and _server_url:
+        if changed_files:
+            md_set: set[str] = set()
+            for f in changed_files:
+                if Path(f).suffix not in TARGET_EXTENSIONS:
+                    continue
+                dir_md = context_dir / (str(Path(f).parent) + ".md")
+                if dir_md.exists():
+                    md_set.add(str(dir_md.relative_to(context_dir)).replace("\\", "/"))
+                file_md = context_dir / Path(f).with_suffix('.md')
+                if file_md.exists():
+                    md_set.add(str(file_md.relative_to(context_dir)).replace("\\", "/"))
+            md_paths = sorted(md_set)
+            if not md_paths:
+                return
+            result = _http_post("/api/v1/index/upsert", {"files": md_paths})
+        else:
+            result = _http_post("/api/v1/index/rebuild", {})
+
+        if result:
+            count = result.get("indexed_files") or result.get("upserted_files") or 0
+            if count:
+                log(f"벡터 인덱스 갱신: {count}개 문서")
+            if result.get("error"):
+                log(f"[경고] 벡터 인덱싱 오류: {result['error']}")
+        return
+
+    # ── 로컬 모드: subprocess CLI 호출 ──
     cmd_base = _get_context_search_cmd(base_dir)
     if not cmd_base:
         log("[경고] context_search를 찾을 수 없어 벡터 인덱싱 건너뜀")
@@ -507,9 +604,20 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
 
 def search_related_contexts(base_dir: Path, query: str, n_results: int = 3) -> list[dict]:
     """
-    context_search.exe --search를 호출하여 관련 컨텍스트를 검색한다.
+    관련 컨텍스트를 검색한다.
+    서버 모드: HTTP API, 로컬 모드: context_search.exe --search.
     반환: [{"file": ..., "content_preview": ..., "tags": [...], ...}, ...]
     """
+    # ── 서버 모드: HTTP API 사용 ──
+    if _server_mode and _server_url:
+        result = _http_post("/api/v1/search/combined", {
+            "query": query, "n_results": n_results,
+        }, timeout=30)
+        if result:
+            return result.get("results", [])
+        return []
+
+    # ── 로컬 모드: subprocess CLI 호출 ──
     cmd_base = _get_context_search_cmd(base_dir)
     if not cmd_base:
         return []
@@ -1022,11 +1130,48 @@ def main():
     claude_model = config.get("claude_model", "claude-sonnet-4-6")
     set_claude_model(claude_model)
 
+    # ── 서버 모드 설정 ──
+    global _server_mode, _server_url, _server_proc
+    _server_mode = config.get("server_mode", False)
+    server_port = config.get("server_port", 8100)
+    server_host = config.get("server_host", "0.0.0.0")
+
+    if _server_mode:
+        _server_url = f"http://localhost:{server_port}"
+        # context_search HTTP 서버를 백그라운드 프로세스로 시작
+        cmd = _get_context_search_cmd(base_dir)
+        if cmd:
+            serve_cmd = cmd + ["--serve", str(base_dir), str(server_port), server_host]
+            _server_proc = subprocess.Popen(
+                serve_cmd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding='utf-8', errors='replace',
+            )
+            # 서버 시작 대기 (최대 15초)
+            import urllib.request
+            import urllib.error
+            for _ in range(30):
+                try:
+                    with urllib.request.urlopen(f"{_server_url}/api/v1/health", timeout=2):
+                        break
+                except Exception:
+                    time.sleep(0.5)
+            else:
+                log("[경고] HTTP 서버 시작 대기 타임아웃")
+            log(f"컨텍스트 HTTP 서버: {server_host}:{server_port}")
+        else:
+            log("[경고] context_search를 찾을 수 없어 서버 모드 비활성화")
+            _server_mode = False
+            _server_url = ""
+
     context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
     llm_label = "Gemini" if use_gemini else f"Claude ({claude_model.split('-')[1]})"
-    vector_ok = bool(_get_context_search_cmd(base_dir))
-    vector_label = "ON" if vector_ok else "OFF (context_search 없음)"
+    if _server_mode:
+        vector_label = f"서버 모드 (:{server_port})"
+    else:
+        vector_ok = bool(_get_context_search_cmd(base_dir))
+        vector_label = "ON (로컬)" if vector_ok else "OFF (context_search 없음)"
     log(
         f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | "
         f"자동 리뷰: {'ON' if auto_review else 'OFF'} | "
@@ -1042,10 +1187,17 @@ def main():
     save_state(base_dir, last_hash)
 
     # 최초 실행 또는 인덱스 없을 때 전체 벡터 인덱싱
-    vector_db_path = base_dir / ".claude" / "vector_db"
-    if not vector_db_path.exists():
-        log("벡터 인덱스 초기 구축 중...")
-        update_vector_index(context_dir, base_dir)
+    if _server_mode:
+        # 서버 모드: HTTP API로 상태 확인 후 필요시 rebuild
+        status = _http_get("/api/v1/index/status")
+        if status and status.get("indexed_documents", 0) == 0:
+            log("벡터 인덱스 초기 구축 중...")
+            update_vector_index(context_dir, base_dir)
+    else:
+        vector_db_path = base_dir / ".claude" / "vector_db"
+        if not vector_db_path.exists():
+            log("벡터 인덱스 초기 구축 중...")
+            update_vector_index(context_dir, base_dir)
 
     log("감시 시작... (종료: Ctrl+C)")
 

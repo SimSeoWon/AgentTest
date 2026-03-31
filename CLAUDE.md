@@ -12,8 +12,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **AgentTest**는 Unreal Engine 프로젝트 팀에 배포할 실행 패키지를 빌드하는 개발 저장소다.
 
-배포 대상 직원들은 `dist/` 폴더 전체를 Unreal 프로젝트 루트에 복사하고 `watch.exe`를 실행하면,
-Git 변경 감지 → `.claude/` 구조 자동 생성 → Claude CLI로 RAG 컨텍스트 MD 자동 갱신이 동작한다.
+두 가지 배포 모드를 지원한다:
+
+1. **로컬 모드** (기존): 각 팀원 PC에서 `watch.exe`가 Git 감시 + 컨텍스트 생성 + 벡터 인덱싱을 로컬로 수행
+2. **서버/클라이언트 모드** (신규): 공용 서버 1대에서 Git 감시 + RAG 중앙 관리, 팀원 PC의 Claude Code는 HTTP로 RAG 검색
 
 ### 이 저장소(AgentTest)의 역할
 > `watch.exe`와 MCP 서버들을 **만드는** 곳. 직원들에게 배포되는 것은 `dist/` 폴더 전체다.
@@ -173,6 +175,30 @@ claude -p --dangerously-skip-permissions --model <claude_model>
 → stdin으로 프롬프트 전달 (Windows 명령줄 길이 제한 회피)
 → `config.json`의 `claude_model`로 모델 지정 (기본값: `claude-sonnet-4-6`)
 
+**config.json 스키마:**
+```json
+{
+  "branch": "main",
+  "poll_interval": 60,
+  "auto_review": true,
+  "auto_asset_validation": true,
+  "use_gemini": false,
+  "claude_model": "claude-sonnet-4-6",
+  "server_mode": false,
+  "server_host": "0.0.0.0",
+  "server_port": 8100,
+  "context_server_url": "",
+  "repo_dir": "..."
+}
+```
+
+| 키 | 설명 | 서버 PC | 클라이언트 PC |
+|----|------|---------|-------------|
+| `server_mode` | HTTP 서버 모드 | `true` | `false` |
+| `server_host` | 바인드 주소 | `"0.0.0.0"` | 미사용 |
+| `server_port` | HTTP 포트 | `8100` | 미사용 |
+| `context_server_url` | 원격 서버 URL | `""` (자기 자신) | `"http://<서버IP>:8100"` |
+
 ### 2. `watcher/agent_templates.py`
 
 `watch.py`가 import하는 상수 모음. PyInstaller 번들 시 자동 포함됨.
@@ -274,6 +300,12 @@ related_classes:
 
 ## RAG 검색
 
+### 설계 의도 — 코드 네비게이션
+RAG는 **진실의 원천(source of truth)이 아니라 네비게이션**이다.
+실제 소스코드가 항상 최신 상태를 담고 있으며, RAG의 역할은 **"어디를 봐야 하는지"를 안내하는 메타데이터 인덱스**다.
+에이전트는 RAG 검색 결과를 기반으로 관련 소스 파일을 찾은 뒤, **실제 코드를 직접 읽고 판단**한다.
+따라서 RAG에 시간 순서나 정보 간 우선순위가 없어도 실질적 문제가 되지 않는다.
+
 ### 통합 검색 (`combined_search`)
 에이전트는 **항상 `combined_search`를 우선 사용**한다. 이 툴은 내부적으로:
 1. 벡터 검색(의미 기반) 수행
@@ -297,14 +329,42 @@ watch.exe → context MD 생성 → context_search.exe --upsert 호출 → Chrom
 | 인덱싱 | `watch.py` → `context_search.exe --upsert` | subprocess 위임 |
 | 검색 | `context_search` MCP → `combined_search()` | 벡터+태그 통합 검색 |
 
-### context_search.exe CLI 모드
+### context_search.exe 실행 모드 (3모드)
+
+| 모드 | 실행 방법 | 설명 |
+|------|-----------|------|
+| **서버** | `--serve <root> [port] [host]` | FastAPI HTTP 서버, DoubleBufferedIndex로 무중단 인덱싱 |
+| **클라이언트** | MCP stdio + `context_server_url` 설정 | HTTP로 중앙 서버에 위임 |
+| **로컬** | MCP stdio (기본) | 기존 ChromaDB 직접 사용 |
+
 ```
+context_search.exe --serve   <project_root> [port] [host]     HTTP 서버 모드 (신규)
 context_search.exe --rebuild <project_root>                   전체 재구축
 context_search.exe --upsert  <project_root> <md1> <md2> ...  증분 갱신
 context_search.exe --status  <project_root>                   상태 확인
 context_search.exe --search  <project_root> <query> [n]       통합 검색 (자동 리뷰용)
 context_search.exe                                            MCP 서버 모드 (기본)
 ```
+
+### HTTP 서버 엔드포인트 (--serve 모드)
+
+| Method | Path | 설명 | 슬롯 |
+|--------|------|------|------|
+| POST | `/api/v1/search/combined` | 벡터+태그 통합 검색 | Live (즉시) |
+| POST | `/api/v1/search/vector` | 벡터 검색 | Live (즉시) |
+| POST | `/api/v1/search/tags` | 태그 검색 | Live 캐시 |
+| GET | `/api/v1/tags` | 태그 목록 | Live 캐시 |
+| POST | `/api/v1/index/upsert` | 증분 인덱싱 | Work → 교체 |
+| POST | `/api/v1/index/rebuild` | 전체 재구축 | Work → 교체 |
+| GET | `/api/v1/index/status` | 인덱스 상태 | Live |
+| GET | `/api/v1/health` | 서버 상태 | - |
+
+### 더블 버퍼링 (DoubleBufferedIndex)
+서버 모드에서 벡터 DB와 태그 캐시를 이중화하여 무중단 인덱싱을 지원한다.
+- **Live 슬롯**: 클라이언트 검색이 항상 여기서 즉시 응답 (블로킹 없음)
+- **Work 슬롯**: 커밋 감지 시 여기서 갱신 진행 (Live에 영향 없음)
+- **교체**: 갱신 완료 시 Live ↔ Work 원자적 교체 (태그 캐시 동시 교체)
+- **구현**: 하나의 ChromaDB에 `context_a`/`context_b` 두 컬렉션, 포인터만 교체
 
 ### 인덱싱 흐름
 1. **최초 실행**: `vector_db/` 없으면 `--rebuild`로 전체 인덱싱
@@ -339,6 +399,10 @@ context_search.exe                                            MCP 서버 모드 
 | Claude CLI 외부 호출 | 직원 PC의 Claude 계정/설정 재사용 가능 |
 | ChromaDB + ONNX 임베딩 | PyTorch 불필요(~2GB 절약), 로컬 완결, 오프라인 동작 |
 | 증분 벡터 인덱싱 | 변경된 파일만 upsert — 전체 재인덱싱 불필요 |
+| 서버/클라이언트 3모드 통합 | 하나의 context_search.exe로 로컬/서버/클라이언트 모두 지원, 배포 단순화 |
+| 더블 버퍼링 (Blue-Green) | 인덱싱 중에도 검색 무중단, 6~8명 동시 접속 대응 |
+| 컬렉션 레벨 이중화 | 디렉토리 복사 대신 ChromaDB 컬렉션 2개(context_a/b) 사용, Windows 파일 잠금 문제 회피 |
+| config.json으로 모드 전환 | server_mode/context_server_url 키로 서버/클라이언트/로컬 결정, 코드 변경 불필요 |
 
 ---
 
