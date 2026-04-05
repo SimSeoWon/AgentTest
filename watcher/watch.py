@@ -352,6 +352,56 @@ def _merge_agents(agents_dir: Path) -> list[str]:
     return added
 
 
+DOMAIN_HINT_SCRIPT = '''\
+"""PostToolUse hook: 편집된 파일이 속한 도메인 정보를 Claude에게 전달한다."""
+import sys, json, subprocess
+from pathlib import Path
+
+def main():
+    data = json.load(sys.stdin)
+    file_path = data.get("tool_input", {}).get("file_path", "")
+    if not file_path:
+        return
+
+    cwd = data.get("cwd", ".")
+    exe = Path(cwd) / ".claude" / "mcp" / "context_search.exe"
+    if not exe.exists():
+        return
+
+    query = Path(file_path).stem
+    try:
+        result = subprocess.run(
+            [str(exe), "--search", cwd, query, "3"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=10,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return
+
+        info = json.loads(result.stdout.strip())
+        results = info.get("results", [])
+        domains = [r for r in results if "_domains/" in r.get("file", "")]
+        if domains:
+            d = domains[0]
+            hint = f"[도메인] {d.get('file', '')}\\n{d.get('content_preview', '')[:300]}"
+            print(hint, file=sys.stderr)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _deploy_hook_scripts(claude_dir: Path):
+    """hook 스크립트를 .claude/hooks/에 배포한다."""
+    hooks_dir = claude_dir / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+    script_path = hooks_dir / "domain_hint.py"
+    # 항상 최신으로 갱신
+    script_path.write_text(DOMAIN_HINT_SCRIPT, encoding='utf-8')
+
+
 def _update_project_settings(claude_dir: Path):
     """
     MCP 서버를 두 곳에 머지한다:
@@ -403,6 +453,24 @@ def _update_project_settings(claude_dir: Path):
             mcp[name] = {"command": exe, "args": []}
             added.append(name)
 
+    # hooks 머지 (누락된 이벤트만 추가, 기존 보존)
+    hooks = settings.setdefault("hooks", {})
+    hooks_added = False
+    if "PostToolUse" not in hooks:
+        hooks["PostToolUse"] = [
+            {
+                "matcher": "Edit|Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": sys.executable + " " + str(claude_dir / "hooks" / "domain_hint.py"),
+                        "timeout": 10,
+                    }
+                ]
+            }
+        ]
+        hooks_added = True
+
     settings_path.write_text(
         json.dumps(settings, ensure_ascii=False, indent=2),
         encoding='utf-8'
@@ -410,15 +478,78 @@ def _update_project_settings(claude_dir: Path):
 
     if added:
         log(f"settings.json MCP 등록 추가: {', '.join(added)}")
+    if hooks_added:
+        log("settings.json hooks 등록 추가: PostToolUse (도메인 힌트)")
+
+    # hook 스크립트 배포
+    _deploy_hook_scripts(claude_dir)
 
 
-def _merge_claude_md_section(md_path: Path):
+def _build_domain_map_section(context_dir: Path) -> str:
+    """
+    context/_domains/ 의 도메인 문서를 스캔하여 도메인 맵 섹션을 동적 생성한다.
+    도메인이 없으면 빈 문자열을 반환한다.
+    """
+    domain_dir = context_dir / DOMAIN_DIR_NAME
+    if not domain_dir.exists():
+        return ""
+
+    entries = []
+    for md_file in sorted(domain_dir.glob("*.md")):
+        if md_file.name.startswith("_"):
+            continue
+        try:
+            content = md_file.read_text(encoding='utf-8')
+        except Exception:
+            continue
+
+        # 프론트매터 파싱
+        fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+        if not fm_match:
+            continue
+        fm = fm_match.group(1)
+
+        tags_m = re.search(r'tags:\s*\[([^\]]*)\]', fm)
+        tags = tags_m.group(1).strip() if tags_m else ""
+        cat_m = re.search(r'category:\s*(.+)', fm)
+        category = cat_m.group(1).strip() if cat_m else ""
+        sources = re.findall(r'-\s+(\S+\.md)', fm)
+
+        # 시스템 개요 첫 문장 추출
+        overview_m = re.search(r'## 시스템 개요\s*\n(.+)', content)
+        summary = overview_m.group(1).strip()[:80] if overview_m else ""
+
+        entries.append(f"| {md_file.stem} | {summary} | {tags} | {len(sources)}개 |")
+
+    if not entries:
+        return ""
+
+    section = (
+        "\n### 도메인 맵 (자동 생성)\n\n"
+        "| 도메인 | 개요 | 태그 | 소스 |\n"
+        "|--------|------|------|------|\n"
+        + "\n".join(entries)
+        + "\n\n"
+        "**기능 추가/변경 요청 시 워크플로우:**\n"
+        "1. `combined_search`로 관련 도메인 문서를 먼저 검색\n"
+        "2. 도메인의 '설계 패턴 및 확장 포인트'를 확인\n"
+        "3. `source_documents` 목록의 실제 코드를 읽고 작업 시작\n"
+    )
+    return section
+
+
+def _merge_claude_md_section(md_path: Path, dynamic_section: str = ""):
     """
     지정한 CLAUDE.md 파일에 AgentWatch 관리 구역을 삽입/갱신한다.
     - 마커 구역 있으면 최신 내용으로 교체
     - 없으면 파일 끝에 추가
     - 파일 자체가 없으면 새로 생성
+    dynamic_section: 도메인 맵 등 런타임에 생성되는 추가 섹션
     """
+    full_section = PROJECT_CLAUDE_MD_SECTION.replace(
+        AGENTWATCH_MD_MARKER_END,
+        dynamic_section + AGENTWATCH_MD_MARKER_END,
+    )
     if md_path.exists():
         content = md_path.read_text(encoding='utf-8')
         if AGENTWATCH_MD_MARKER_START in content:
@@ -426,36 +557,36 @@ def _merge_claude_md_section(md_path: Path):
                 re.escape(AGENTWATCH_MD_MARKER_START)
                 + r".*?"
                 + re.escape(AGENTWATCH_MD_MARKER_END),
-                PROJECT_CLAUDE_MD_SECTION,
+                full_section,
                 content,
                 flags=re.DOTALL,
             )
             return content, "갱신"
         else:
-            content = content.rstrip() + "\n\n" + PROJECT_CLAUDE_MD_SECTION + "\n"
+            content = content.rstrip() + "\n\n" + full_section + "\n"
             return content, "추가"
     else:
-        return PROJECT_CLAUDE_MD_SECTION + "\n", "생성"
+        return full_section + "\n", "생성"
 
 
 def _update_project_claude_md(base_dir: Path):
     """
     CLAUDE.md에 AgentWatch 관리 구역을 삽입/갱신한다.
-    대상:
-      1. 프로젝트 루트 CLAUDE.md (항상)
-      2. .claude/CLAUDE.md (존재하는 경우에만 — 팀이 여기서 규칙을 관리하는 경우 대응)
-    항상 실행 (기존 파일 여부 무관)
+    도메인 문서가 존재하면 도메인 맵 섹션도 동적으로 포함한다.
     """
+    context_dir = base_dir / ".claude" / "context"
+    domain_section = _build_domain_map_section(context_dir)
+
     # 1. 루트 CLAUDE.md
     root_md = base_dir / "CLAUDE.md"
-    content, action = _merge_claude_md_section(root_md)
+    content, action = _merge_claude_md_section(root_md, domain_section)
     root_md.write_text(content, encoding='utf-8')
     log(f"CLAUDE.md AgentWatch 구역 {action}")
 
     # 2. .claude/CLAUDE.md (있을 때만)
     dot_claude_md = base_dir / ".claude" / "CLAUDE.md"
     if dot_claude_md.exists():
-        content, action = _merge_claude_md_section(dot_claude_md)
+        content, action = _merge_claude_md_section(dot_claude_md, domain_section)
         dot_claude_md.write_text(content, encoding='utf-8')
         log(f".claude/CLAUDE.md AgentWatch 구역 {action}")
 
@@ -694,6 +825,54 @@ def _group_files(changed_files: list[str], repo_dir: Path) -> dict[str, list[str
     return final_groups
 
 
+def _find_matching_domain(context_dir: Path, file_paths: list[str]) -> str:
+    """
+    파일이 속한 도메인 문서를 찾아 핵심 섹션(시스템 개요 + 설계 패턴)을 반환한다.
+    """
+    domain_dir = context_dir / DOMAIN_DIR_NAME
+    if not domain_dir.exists():
+        return ""
+
+    # file_paths를 MD 경로로 변환하여 매칭
+    file_stems = set()
+    for fp in file_paths:
+        file_stems.add(str(Path(fp).with_suffix('.md')))
+        file_stems.add(str(Path(fp).parent) + ".md")
+
+    for md_file in domain_dir.glob("*.md"):
+        if md_file.name.startswith("_"):
+            continue
+        try:
+            content = md_file.read_text(encoding='utf-8')
+        except Exception:
+            continue
+
+        # source_documents 파싱
+        sources = set(re.findall(r'-\s+(\S+\.md)', content))
+        if not sources:
+            continue
+
+        # 파일이 이 도메인에 속하는지 확인
+        if not (file_stems & sources):
+            continue
+
+        # 시스템 개요 + 설계 패턴 섹션 추출 (1500자 이내)
+        sections = []
+        for header in ("## 시스템 개요", "## 클래스 간 관계", "## 설계 패턴"):
+            match = re.search(
+                rf'({header}\s*\n)(.*?)(?=\n## |\Z)',
+                content, re.DOTALL,
+            )
+            if match:
+                sections.append(match.group(1) + match.group(2).strip())
+
+        if sections:
+            domain_text = "\n\n".join(sections)
+            return domain_text[:1500]
+
+    return ""
+
+
 def _build_related_context(base_dir: Path, file_path: str, context: str) -> str:
     """
     파일의 컨텍스트 요약을 검색 쿼리로 사용하여 관련 파일 컨텍스트를 수집한다.
@@ -766,6 +945,12 @@ def _process_directory_group(
         except Exception:
             pass
 
+    # 도메인 컨텍스트 검색 (시스템 수준 맥락)
+    domain_ctx = _find_matching_domain(context_dir, included_paths)
+    domain_notice = ""
+    if domain_ctx:
+        domain_notice = f"\n\n[도메인 컨텍스트 — 이 파일이 속한 시스템의 전체 구조]\n{domain_ctx}\n"
+
     related = _build_related_context(base_dir, included_paths[0], existing_context)
     related_notice = ""
     if related:
@@ -807,6 +992,7 @@ def _process_directory_group(
             f"## 2. 버그·안전성 검토\n"
             f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토.\n"
             f"결과: | 파일 | 위험도 | 라인 | 설명 | 권장 수정 |"
+            f"{domain_notice}"
             f"{comments_notice}"
             f"{related_notice}\n\n"
             f"파일 경로: {file_path_str}\n"
@@ -1109,6 +1295,90 @@ def _get_existing_domains(context_dir: Path) -> dict[str, set[str]]:
     return domains
 
 
+def _cleanup_stale_domains(context_dir: Path):
+    """소스 문서가 50% 이상 사라진 stale 도메인을 삭제한다."""
+    existing = _get_existing_domains(context_dir)
+    domain_dir = context_dir / DOMAIN_DIR_NAME
+    if not domain_dir.exists():
+        return
+
+    for domain_name, sources in existing.items():
+        if not sources:
+            continue
+        alive = sum(1 for s in sources if (context_dir / s).exists())
+        if alive < len(sources) * 0.5:
+            md_path = domain_dir / f"{domain_name}.md"
+            md_path.unlink(missing_ok=True)
+            log(f"stale 도메인 삭제: {domain_name} (소스 {alive}/{len(sources)} 존재)")
+
+
+def _generate_architecture_overview(context_dir: Path, use_gemini: bool = False):
+    """
+    도메인 문서가 3개 이상이면 전체를 종합한 아키텍처 개요를 생성한다.
+    _domains/_overview.md에 저장한다.
+    """
+    domain_dir = context_dir / DOMAIN_DIR_NAME
+    if not domain_dir.exists():
+        return
+
+    domain_files = [f for f in domain_dir.glob("*.md") if not f.name.startswith("_")]
+    if len(domain_files) < 3:
+        return
+
+    # 각 도메인의 시스템 개요를 수집
+    summaries = []
+    for md_file in sorted(domain_files):
+        try:
+            content = md_file.read_text(encoding='utf-8')
+            overview_m = re.search(r'## 시스템 개요\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
+            if overview_m:
+                summaries.append(f"### {md_file.stem}\n{overview_m.group(1).strip()}")
+        except Exception:
+            continue
+
+    if len(summaries) < 3:
+        return
+
+    prompt = (
+        f"아래는 프로젝트의 주요 시스템(도메인) 목록이다.\n"
+        f"이 도메인들을 종합하여 '프로젝트 아키텍처 개요'를 생성해줘.\n\n"
+        f"형식:\n"
+        f"---\n"
+        f"tags: [아키텍처, 개요]\n"
+        f"category: 도메인/아키텍처개요\n"
+        f"type: overview\n"
+        f"---\n\n"
+        f"## 프로젝트 구조 요약\n"
+        f"(전체 시스템의 큰 그림을 3~5문장으로)\n\n"
+        f"## 시스템 간 관계\n"
+        f"(도메인들이 어떻게 연결되는지, 데이터가 어떻게 흐르는지)\n\n"
+        f"## 핵심 진입점\n"
+        f"(새로운 팀원이 가장 먼저 봐야 할 시스템과 파일)\n\n"
+        f"주의: '## 코멘트' 섹션은 생성하지 마.\n\n"
+        f"=== 도메인 목록 ===\n\n"
+        + "\n\n".join(summaries)
+    )
+
+    raw = _call_llm(prompt, use_gemini=use_gemini)
+    if not raw:
+        return
+
+    overview_path = domain_dir / "_overview.md"
+    # 기존 코멘트 보존
+    overview_content = raw.strip()
+    if overview_path.exists():
+        existing_comments = _extract_comments_section(
+            overview_path.read_text(encoding='utf-8')
+        )
+        if existing_comments:
+            overview_content = re.sub(
+                r'## 코멘트\s*\n.*', '', overview_content, flags=re.DOTALL
+            ).rstrip()
+            overview_content = overview_content + "\n\n" + existing_comments + "\n"
+    overview_path.write_text(overview_content, encoding='utf-8')
+    log(f"아키텍처 개요 갱신: {len(domain_files)}개 도메인 종합")
+
+
 def promote_domains(
     base_dir: Path, context_dir: Path,
     use_gemini: bool = False,
@@ -1117,6 +1387,9 @@ def promote_domains(
     검색 로그를 분석하여 자주 함께 검색되는 문서 클러스터를
     도메인 문서로 승급시킨다.
     """
+    # stale 도메인 정리
+    _cleanup_stale_domains(context_dir)
+
     clusters = _analyze_search_patterns(base_dir)
     if not clusters:
         return
@@ -1196,13 +1469,114 @@ def promote_domains(
         safe_name = re.sub(r'[\\/:*?"<>|]', '_', domain_name)
 
         out_path = domain_dir / f"{safe_name}.md"
-        out_path.write_text(raw.strip(), encoding='utf-8')
+        # 기존 코멘트 보존
+        domain_content = raw.strip()
+        if out_path.exists():
+            existing_comments = _extract_comments_section(
+                out_path.read_text(encoding='utf-8')
+            )
+            if existing_comments:
+                domain_content = re.sub(
+                    r'## 코멘트\s*\n.*', '', domain_content, flags=re.DOTALL
+                ).rstrip()
+                domain_content = domain_content + "\n\n" + existing_comments + "\n"
+        out_path.write_text(domain_content, encoding='utf-8')
         log(f"도메인 승급: {safe_name} ({len(cluster)}개 문서 종합)")
+
+    # 도메인 3개 이상이면 아키텍처 맵 자동 생성
+    _generate_architecture_overview(context_dir, use_gemini)
 
     # 도메인 문서 포함하여 벡터 인덱스 재구축
     log("도메인 반영 — 벡터 인덱스 갱신 중...")
     update_vector_index(context_dir, base_dir)
     log("벡터 인덱스 갱신 완료")
+
+
+HEALTH_CHECK_INTERVAL = 50  # N번째 폴링마다 건강도 리포트 생성
+
+
+def generate_health_report(base_dir: Path, context_dir: Path, reviews_dir: Path):
+    """
+    도메인별 기술 부채, 리뷰 지적 빈도, 미해결 고민을 집계하여
+    프로젝트 건강도 리포트를 생성한다. LLM 호출 없이 파일 파싱만으로 동작.
+    """
+    existing_domains = _get_existing_domains(context_dir)
+    if not existing_domains:
+        return
+
+    domain_stats: dict[str, dict] = {}
+
+    for domain_name, sources in existing_domains.items():
+        stats = {"issues": 0, "comments": 0, "concerns": 0, "files": len(sources)}
+
+        # 소스 문서에서 개선 필요 사항 / 코멘트 집계
+        for src in sources:
+            md_path = context_dir / src
+            if not md_path.exists():
+                continue
+            try:
+                content = md_path.read_text(encoding='utf-8')
+            except Exception:
+                continue
+
+            # "## 개선 필요 사항" 항목 수 카운트
+            improve_m = re.search(r'## 개선 필요 사항\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
+            if improve_m:
+                text = improve_m.group(1).strip()
+                if text and text != "없음":
+                    stats["issues"] += text.count("\n") + 1
+
+            # 코멘트 집계
+            comments = _extract_comments_section(content)
+            if comments:
+                stats["comments"] += comments.count("\n") + 1
+                stats["concerns"] += comments.count("[고민]")
+
+        domain_stats[domain_name] = stats
+
+    # 리뷰 리포트에서 도메인별 지적 빈도 (최근 20개 리뷰)
+    review_files = sorted(reviews_dir.glob("*.md"), reverse=True)[:20]
+    domain_review_counts: dict[str, int] = {d: 0 for d in existing_domains}
+    for rf in review_files:
+        try:
+            review_content = rf.read_text(encoding='utf-8')
+            for domain_name, sources in existing_domains.items():
+                for src in sources:
+                    stem = Path(src).stem
+                    if stem in review_content:
+                        domain_review_counts[domain_name] += 1
+                        break
+        except Exception:
+            continue
+
+    # 리포트 생성
+    lines = [
+        "# 프로젝트 건강도 리포트\n",
+        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
+        "\n## 도메인별 현황\n",
+        "| 도메인 | 소스 파일 | 개선 사항 | 코멘트 | 미결 고민 | 리뷰 지적 |",
+        "|--------|----------|----------|--------|----------|----------|",
+    ]
+    for domain_name, stats in sorted(domain_stats.items()):
+        review_count = domain_review_counts.get(domain_name, 0)
+        lines.append(
+            f"| {domain_name} | {stats['files']} | {stats['issues']} | "
+            f"{stats['comments']} | {stats['concerns']} | {review_count} |"
+        )
+
+    # 주의 필요 도메인
+    high_debt = [d for d, s in domain_stats.items() if s["issues"] >= 5]
+    high_concerns = [d for d, s in domain_stats.items() if s["concerns"] >= 3]
+    if high_debt or high_concerns:
+        lines.append("\n## 주의 필요\n")
+        if high_debt:
+            lines.append(f"- **기술 부채 높음**: {', '.join(high_debt)}")
+        if high_concerns:
+            lines.append(f"- **미결 고민 많음**: {', '.join(high_concerns)}")
+
+    report_path = reviews_dir / "_health_report.md"
+    report_path.write_text("\n".join(lines), encoding='utf-8')
+    log(f"건강도 리포트 갱신 → {report_path.relative_to(base_dir)}")
 
 
 # 기본 모델 (config.json의 claude_model로 오버라이드 가능)
@@ -1511,6 +1885,13 @@ def main():
                     promote_domains(base_dir, context_dir, use_gemini=use_gemini)
                 except Exception as e:
                     log(f"[경고] 도메인 체크 오류: {e}")
+
+            # 주기적 건강도 리포트 생성
+            if poll_count % HEALTH_CHECK_INTERVAL == 0:
+                try:
+                    generate_health_report(base_dir, context_dir, reviews_dir)
+                except Exception as e:
+                    log(f"[경고] 건강도 리포트 오류: {e}")
 
             if not git_fetch(repo_dir):
                 log("[경고] git fetch 실패, 재시도 대기 중...")

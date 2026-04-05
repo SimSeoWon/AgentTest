@@ -72,8 +72,13 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 │   │   ├── commandlet_runner.exe
 │   │   └── gemini_query.exe
 │   ├── vector_db/                   ← ChromaDB 벡터 인덱스 (자동 생성)
+│   ├── hooks/                     ← Claude Code hook 스크립트 (자동 배포)
+│   │   └── domain_hint.py         ← 파일 편집 시 도메인 힌트 제공
 │   ├── reviews/                   ← 커밋별 코드 리뷰 / 에셋 검증 리포트
+│   │   └── _health_report.md      ← 프로젝트 건강도 리포트 (자동 생성)
+│   ├── search_log.jsonl           ← 검색 로그 (도메인 승급 분석용)
 │   ├── context/                   ← 변경된 소스 파일 → Claude가 생성한 MD
+│   │   └── _domains/              ← 도메인 문서 (자동 승급) + _overview.md
 │   │   ├── AI/
 │   │   ├── UI/
 │   │   ├── 게임플로우/
@@ -173,9 +178,16 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 - 기존 도메인과 80% 이상 겹치면 중복 생성 방지
 - `context_search.exe`의 `combined_search` 호출 시 결과 문서 ID가 자동 로깅됨
 - 도메인 문서 스키마: `type: domain`, `source_documents` 목록, 시스템 개요/클래스 관계/데이터 흐름/설계 패턴 포함
+- **stale 도메인 자동 정리**: 소스 문서가 50% 이상 삭제된 도메인은 `_cleanup_stale_domains()`로 자동 삭제
+
+**도메인 문서 활용**
+- **CLAUDE.md 도메인 맵 주입**: `_update_project_claude_md()` 시 `_build_domain_map_section()`으로 도메인 목록 테이블을 AgentWatch 마커 구역에 동적 삽입 → 세션 시작 시 프로젝트 주요 시스템 즉시 인식
+- **코드 리뷰 도메인 주입**: `_find_matching_domain()`으로 변경 파일이 속한 도메인의 "시스템 개요 + 클래스 관계 + 설계 패턴"을 리뷰 프롬프트에 주입 → 시스템 수준 영향 파악
+- **기획 가이드**: CLAUDE.md 도메인 맵에 기능 추가/변경 시 워크플로우 규칙 포함
 
 **코드 리뷰 흐름 (컨텍스트 생성과 통합)**
 - 컨텍스트 MD 생성과 코드 리뷰를 **1회의 LLM 호출**로 동시 수행
+- **도메인 컨텍스트 주입**: `_find_matching_domain()`으로 변경 파일이 속한 도메인의 시스템 구조 자동 주입
 - **관련 컨텍스트 자동 검색**: 모듈별로 `context_search.exe --search`를 호출하여 관련 파일 컨텍스트 3개를 수집, 프롬프트에 주입
 - **개발자 코멘트 참조**: 컨텍스트 MD의 `## 코멘트` 섹션이 있으면 "인지된 항목"으로 프롬프트에 주입하여 반복 지적 방지
 - 통합 리포트: 모듈별 리뷰 결과를 직접 취합 (추가 LLM 호출 없음)
@@ -265,7 +277,7 @@ claude -p --dangerously-skip-permissions --model <claude_model>
 
 | 서버 | 빌드 산출물 | 제공 툴 | 사용 에이전트 |
 |------|------------|---------|-------------|
-| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status` | 02, 03, 05, 07, 08, 09, 10 |
+| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status`, `impact_analysis` | 02, 03, 04, 05, 07, 08, 09, 10 |
 | `log_analyzer` | `mcp/log_analyzer.exe` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |

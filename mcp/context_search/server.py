@@ -578,6 +578,94 @@ def index_status(project_root: str = ".") -> str:
         return json.dumps({"status": "오류", "error": str(e), "vector_available": True}, ensure_ascii=False)
 
 
+@mcp.tool()
+def impact_analysis(system_name: str, project_root: str = ".") -> str:
+    """
+    도메인 문서 기반으로 시스템 변경 시 영향받는 파일 목록과 확장 포인트를 분석한다.
+    기능 추가/변경 계획 시 영향 범위를 사전에 파악하는 데 사용한다.
+
+    Args:
+        system_name: 분석할 시스템/도메인 이름 (예: "미션시스템", "전투")
+        project_root: 프로젝트 루트 경로 (기본값: 현재 디렉토리)
+    """
+    context_dir = Path(project_root) / ".claude" / "context"
+    domain_dir = context_dir / "_domains"
+    if not domain_dir.exists():
+        return json.dumps({
+            "error": "도메인 문서가 없습니다. 검색 데이터가 충분히 쌓이면 자동 생성됩니다.",
+        }, ensure_ascii=False)
+
+    # 1) 도메인 문서 매칭
+    matched_domain = None
+    matched_content = ""
+    for md_file in domain_dir.glob("*.md"):
+        if md_file.name.startswith("_"):
+            continue
+        if system_name.lower() in md_file.stem.lower():
+            matched_content = md_file.read_text(encoding="utf-8")
+            matched_domain = md_file.stem
+            break
+
+    # 이름 매칭 실패 시 내용 검색
+    if not matched_domain:
+        for md_file in domain_dir.glob("*.md"):
+            if md_file.name.startswith("_"):
+                continue
+            content = md_file.read_text(encoding="utf-8")
+            if system_name.lower() in content.lower():
+                matched_content = content
+                matched_domain = md_file.stem
+                break
+
+    if not matched_domain:
+        return json.dumps({
+            "error": f"'{system_name}'과 일치하는 도메인을 찾을 수 없습니다.",
+            "available_domains": [f.stem for f in domain_dir.glob("*.md") if not f.name.startswith("_")],
+        }, ensure_ascii=False, indent=2)
+
+    # 2) source_documents에서 1차 영향 파일 추출
+    source_docs = re.findall(r'-\s+(\S+\.md)', matched_content)
+    primary_files: list[dict] = []
+    secondary_files: list[dict] = []
+
+    for doc in source_docs:
+        md_path = context_dir / doc
+        if not md_path.exists():
+            continue
+        doc_content = md_path.read_text(encoding="utf-8")
+        meta = _parse_frontmatter(doc_content)
+        primary_files.append({
+            "file": doc,
+            "category": meta.get("category", ""),
+            "tags": meta.get("tags", []),
+        })
+
+        # 3) related_classes로 2차 영향 파일 수집
+        for cls_name, cls_path in meta.get("related_classes", {}).items():
+            rel_md = str(Path(cls_path).with_suffix('.md'))
+            if rel_md not in source_docs:
+                secondary_files.append({
+                    "file": rel_md,
+                    "class": cls_name,
+                    "referenced_by": doc,
+                })
+
+    # 4) 확장 포인트 추출
+    ext_match = re.search(
+        r'## 설계 패턴.*?\n(.*?)(?=\n## |\Z)',
+        matched_content, re.DOTALL,
+    )
+    extension_points = ext_match.group(1).strip() if ext_match else ""
+
+    return json.dumps({
+        "domain": matched_domain,
+        "primary_files": primary_files,
+        "secondary_files": secondary_files,
+        "extension_points": extension_points,
+        "total_impact": len(primary_files) + len(secondary_files),
+    }, ensure_ascii=False, indent=2)
+
+
 def _upsert_files(project_root: str, md_relative_paths: list[str]) -> str:
     """지정된 MD 파일만 벡터 인덱스에 upsert한다. (CLI용)"""
     if _is_remote_mode():
