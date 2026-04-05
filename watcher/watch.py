@@ -506,6 +506,19 @@ def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]
     return [f for f in result.stdout.strip().split('\n') if f]
 
 
+def _list_all_source_files(repo_dir: Path) -> list[str]:
+    """Git으로 추적 중인 모든 소스 파일 목록을 반환한다."""
+    result = subprocess.run(
+        ["git", "ls-files"],
+        cwd=repo_dir, capture_output=True, text=True,
+        encoding='utf-8', errors='replace'
+    )
+    if result.returncode != 0:
+        return []
+    return [f for f in result.stdout.strip().split('\n')
+            if f and Path(f).suffix in TARGET_EXTENSIONS]
+
+
 # ─────────────────────────────────────────
 # 벡터 인덱싱 (context_search.exe에 위임)
 # ─────────────────────────────────────────
@@ -535,12 +548,14 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
             for f in changed_files:
                 if Path(f).suffix not in TARGET_EXTENSIONS:
                     continue
+                # 디렉토리 단위 MD (소규모 그룹)
                 dir_md = context_dir / (str(Path(f).parent) + ".md")
                 if dir_md.exists():
                     md_set.add(str(dir_md.relative_to(context_dir)).replace("\\", "/"))
-                file_md = context_dir / Path(f).with_suffix('.md')
-                if file_md.exists():
-                    md_set.add(str(file_md.relative_to(context_dir)).replace("\\", "/"))
+                # stem 단위 MD (대규모 그룹에서 분할된 경우)
+                stem_md = context_dir / Path(f).with_suffix('.md')
+                if stem_md.exists():
+                    md_set.add(str(stem_md.relative_to(context_dir)).replace("\\", "/"))
             md_paths = sorted(md_set)
             if not md_paths:
                 return
@@ -563,19 +578,18 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
         return
 
     if changed_files:
-        # 변경된 소스 파일의 디렉토리 → 디렉토리 단위 MD 경로 수집 (중복 제거)
         md_set: set[str] = set()
         for f in changed_files:
             if Path(f).suffix not in TARGET_EXTENSIONS:
                 continue
-            # 디렉토리 단위 MD: Source/Module/SubDir.md
+            # 디렉토리 단위 MD (소규모 그룹)
             dir_md = context_dir / (str(Path(f).parent) + ".md")
             if dir_md.exists():
                 md_set.add(str(dir_md.relative_to(context_dir)).replace("\\", "/"))
-            # 하위 호환: 기존 클래스 단위 MD도 체크
-            file_md = context_dir / Path(f).with_suffix('.md')
-            if file_md.exists():
-                md_set.add(str(file_md.relative_to(context_dir)).replace("\\", "/"))
+            # stem 단위 MD (대규모 그룹에서 분할된 경우)
+            stem_md = context_dir / Path(f).with_suffix('.md')
+            if stem_md.exists():
+                md_set.add(str(stem_md.relative_to(context_dir)).replace("\\", "/"))
         md_paths = sorted(md_set)
         if not md_paths:
             return
@@ -652,20 +666,32 @@ HEADER_EXTENSIONS = {'.h', '.hpp', '.inl'}
 GROUP_CONTENT_LIMIT = 8000
 
 
-def _group_by_directory(changed_files: list[str], repo_dir: Path) -> dict[str, list[str]]:
+def _group_files(changed_files: list[str], repo_dir: Path) -> dict[str, list[str]]:
     """
-    변경 파일을 부모 디렉토리(모듈) 단위로 묶는다.
-    키: 부모 디렉토리 상대경로 (예: Source/ModularStage/Mission/TaskSystem)
-    값: 해당 디렉토리의 파일 경로 목록
+    변경 파일을 디렉토리 단위로 묶되, 합산 크기가 GROUP_CONTENT_LIMIT를 초과하면
+    파일명(stem) 단위로 분할한다.
     """
-    groups: dict[str, list[str]] = {}
+    # 1단계: 디렉토리 단위 그룹핑
+    dir_groups: dict[str, list[str]] = {}
     for file_path in changed_files:
         full_path = repo_dir / file_path
         if not full_path.exists() or full_path.suffix not in TARGET_EXTENSIONS:
             continue
         dir_key = str(Path(file_path).parent)
-        groups.setdefault(dir_key, []).append(file_path)
-    return groups
+        dir_groups.setdefault(dir_key, []).append(file_path)
+
+    # 2단계: 큰 그룹은 stem 단위로 분할
+    final_groups: dict[str, list[str]] = {}
+    for dir_key, files in dir_groups.items():
+        total_size = sum((repo_dir / f).stat().st_size for f in files)
+        if total_size <= GROUP_CONTENT_LIMIT:
+            final_groups[dir_key] = files
+        else:
+            for fp in files:
+                stem_key = str(Path(fp).parent / Path(fp).stem)
+                final_groups.setdefault(stem_key, []).append(fp)
+
+    return final_groups
 
 
 def _build_related_context(base_dir: Path, file_path: str, context: str) -> str:
@@ -792,9 +818,9 @@ def _process_directory_group(
             content=code_block,
         )
 
-    dir_name = Path(dir_key).name
+    group_name = Path(dir_key).name
     file_list = ", ".join(Path(f).name for f in included_paths)
-    print(f"  [분석] {dir_name}/ ({len(included_paths)}개: {file_list})")
+    print(f"  [분석] {group_name} ({len(included_paths)}개: {file_list})")
 
     raw = _call_llm(prompt, use_gemini=use_gemini)
     if raw is None:
@@ -836,7 +862,7 @@ def process_commit(
     LLM 1회 호출로 두 작업을 동시 수행하여 시간을 절반으로 줄인다.
     """
     base_dir = context_dir.parent.parent
-    groups = _group_by_directory(changed_files, repo_dir)
+    groups = _group_files(changed_files, repo_dir)
     if not groups:
         log("소스 파일 없음 — 건너뜀")
         return
@@ -905,6 +931,278 @@ def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
         f"---\n\n"
         f"{modules_section}"
     )
+
+
+def initial_context_build(
+    repo_dir: Path, context_dir: Path, base_dir: Path,
+    use_gemini: bool = False,
+):
+    """
+    기존 소스 파일 중 컨텍스트 MD가 없는 모듈을 일괄 생성한다.
+    최초 설치 시 전체 RAG를 초기화하며, 중단 후 재실행 시 누락분만 보충한다.
+    """
+    all_files = _list_all_source_files(repo_dir)
+    if not all_files:
+        log("소스 파일 없음 — 초기 컨텍스트 생성 건너뜀")
+        return
+
+    groups = _group_files(all_files, repo_dir)
+
+    # 이미 MD가 있는 그룹 제외 (중단 후 재실행 시 누락분만 처리)
+    missing: dict[str, list[str]] = {}
+    for dir_key, files in groups.items():
+        md_path = context_dir / (dir_key + ".md")
+        if not md_path.exists():
+            missing[dir_key] = files
+
+    if not missing:
+        return
+
+    total_modules = len(missing)
+    total_files = sum(len(f) for f in missing.values())
+    log(f"초기 컨텍스트 생성 시작 — {total_modules}개 모듈, {total_files}개 파일 (병렬 {MAX_WORKERS})")
+
+    completed = 0
+    success = 0
+    fail = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                _process_directory_group,
+                repo_dir, context_dir, base_dir, dk, fps,
+                False,  # auto_review=False (컨텍스트만 생성)
+                use_gemini,
+            ): dk
+            for dk, fps in missing.items()
+        }
+        for future in as_completed(futures):
+            dk = futures[future]
+            completed += 1
+            try:
+                result = future.result()
+                if result.get("context_msg"):
+                    success += 1
+                else:
+                    fail += 1
+            except Exception as e:
+                log(f"[경고] 초기화 실패 ({dk}): {e}")
+                fail += 1
+            if completed % 10 == 0 or completed == total_modules:
+                log(f"초기화 진행: {completed}/{total_modules} (성공: {success}, 실패: {fail})")
+
+    log(f"초기 컨텍스트 생성 완료 — 성공: {success}, 실패: {fail}")
+
+    # 벡터 인덱스 전체 구축
+    log("벡터 인덱스 전체 구축 중...")
+    update_vector_index(context_dir, base_dir)  # changed_files=None → rebuild
+    log("벡터 인덱스 구축 완료")
+
+
+# ─────────────────────────────────────────
+# 도메인 자동 승급 (데이터 → 정보)
+# ─────────────────────────────────────────
+
+DOMAIN_DIR_NAME = "_domains"
+COOCCURRENCE_THRESHOLD = 5   # 동시 출현 최소 횟수
+DOMAIN_MIN_DOCS = 2          # 도메인 최소 문서 수
+DOMAIN_CHECK_INTERVAL = 10   # N번째 폴링마다 도메인 체크
+
+
+def _analyze_search_patterns(base_dir: Path) -> list[list[str]]:
+    """
+    검색 로그를 분석하여 자주 함께 검색되는 문서 클러스터를 식별한다.
+    반환: [[doc1, doc2, ...], [doc3, doc4], ...] 형태의 클러스터 목록
+    """
+    log_path = base_dir / ".claude" / "search_log.jsonl"
+    if not log_path.exists():
+        return []
+
+    # 1) 로그에서 결과 문서 목록 수집
+    search_sessions: list[list[str]] = []
+    try:
+        for line in log_path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            results = entry.get("results", [])
+            # 도메인 문서 자체는 제외
+            results = [r for r in results if DOMAIN_DIR_NAME + "/" not in r]
+            if len(results) >= 2:
+                search_sessions.append(results)
+    except Exception:
+        return []
+
+    if not search_sessions:
+        return []
+
+    # 2) 문서 쌍의 동시 출현 빈도 카운트
+    from collections import Counter
+    pair_counts: Counter = Counter()
+    for session in search_sessions:
+        docs = sorted(set(session))
+        for i in range(len(docs)):
+            for j in range(i + 1, len(docs)):
+                pair_counts[frozenset([docs[i], docs[j]])] += 1
+
+    # 3) 임계값 이상인 쌍으로 그래프 구축 + 연결 요소 추출
+    strong_pairs = [pair for pair, cnt in pair_counts.items()
+                    if cnt >= COOCCURRENCE_THRESHOLD]
+    if not strong_pairs:
+        return []
+
+    # Union-Find로 클러스터링
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.get(x, x) != x:
+            parent[x] = parent.get(parent[x], parent[x])
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for pair in strong_pairs:
+        a, b = list(pair)
+        parent.setdefault(a, a)
+        parent.setdefault(b, b)
+        union(a, b)
+
+    # 클러스터 수집
+    clusters: dict[str, list[str]] = {}
+    for doc in parent:
+        root = find(doc)
+        clusters.setdefault(root, []).append(doc)
+
+    return [docs for docs in clusters.values() if len(docs) >= DOMAIN_MIN_DOCS]
+
+
+def _get_existing_domains(context_dir: Path) -> dict[str, set[str]]:
+    """기존 도메인 문서와 그 소스 문서 목록을 반환한다."""
+    domain_dir = context_dir / DOMAIN_DIR_NAME
+    if not domain_dir.exists():
+        return {}
+
+    domains: dict[str, set[str]] = {}
+    for md_file in domain_dir.glob("*.md"):
+        try:
+            content = md_file.read_text(encoding='utf-8')
+            # source_documents 파싱
+            sources: set[str] = set()
+            in_sources = False
+            for line in content.splitlines():
+                if line.strip().startswith("source_documents:"):
+                    in_sources = True
+                    continue
+                if in_sources:
+                    if line.strip().startswith("- "):
+                        sources.add(line.strip()[2:].strip())
+                    elif line.strip() and not line.startswith(" "):
+                        break
+            domains[md_file.stem] = sources
+        except Exception:
+            continue
+    return domains
+
+
+def promote_domains(
+    base_dir: Path, context_dir: Path,
+    use_gemini: bool = False,
+):
+    """
+    검색 로그를 분석하여 자주 함께 검색되는 문서 클러스터를
+    도메인 문서로 승급시킨다.
+    """
+    clusters = _analyze_search_patterns(base_dir)
+    if not clusters:
+        return
+
+    existing = _get_existing_domains(context_dir)
+    domain_dir = context_dir / DOMAIN_DIR_NAME
+    domain_dir.mkdir(parents=True, exist_ok=True)
+
+    # 이미 도메인으로 만들어진 클러스터인지 확인
+    new_clusters = []
+    for cluster in clusters:
+        cluster_set = set(cluster)
+        already = False
+        for domain_sources in existing.values():
+            # 소스 문서의 80% 이상이 겹치면 이미 존재하는 도메인
+            if len(cluster_set & domain_sources) >= len(cluster_set) * 0.8:
+                already = True
+                break
+        if not already:
+            new_clusters.append(cluster)
+
+    if not new_clusters:
+        return
+
+    log(f"도메인 승급 후보: {len(new_clusters)}개 클러스터")
+
+    for cluster in new_clusters:
+        # 클러스터 내 문서들의 컨텍스트 MD 읽기
+        doc_contents = []
+        for doc_file in sorted(cluster):
+            md_path = context_dir / doc_file
+            if md_path.exists():
+                try:
+                    content = md_path.read_text(encoding='utf-8')
+                    doc_contents.append(f"[{doc_file}]\n{content}")
+                except Exception:
+                    continue
+
+        if len(doc_contents) < DOMAIN_MIN_DOCS:
+            continue
+
+        # LLM으로 도메인 문서 생성
+        source_list = "\n".join(f"  - {d}" for d in sorted(cluster))
+        prompt = (
+            f"아래는 자주 함께 검색되는 관련 코드 컨텍스트들이다.\n"
+            f"이 문서들을 종합하여 하나의 '도메인 문서'를 생성해줘.\n\n"
+            f"반드시 아래 형식을 지켜줘:\n"
+            f"---\n"
+            f"tags: [태그1, 태그2, ...]\n"
+            f"category: 도메인/<도메인명>\n"
+            f"type: domain\n"
+            f"source_documents:\n{source_list}\n"
+            f"---\n\n"
+            f"## 시스템 개요\n"
+            f"(이 기능/시스템이 하는 일, 주요 컴포넌트 역할)\n\n"
+            f"## 클래스 간 관계\n"
+            f"(상호작용, 의존 관계, 호출 흐름)\n\n"
+            f"## 데이터 흐름\n"
+            f"(주요 데이터가 어떻게 이동하고 변환되는지)\n\n"
+            f"## 설계 패턴 및 확장 포인트\n"
+            f"(사용된 패턴, 수정 시 주의할 지점)\n\n"
+            f"주의:\n"
+            f"- 도메인명은 한글로, 이 기능/시스템을 대표하는 이름으로 지어줘\n"
+            f"- '## 코멘트' 섹션은 생성하지 마\n\n"
+            f"=== 소스 문서들 ===\n\n"
+            + "\n\n---\n\n".join(doc_contents)
+        )
+
+        raw = _call_llm(prompt, use_gemini=use_gemini)
+        if not raw:
+            continue
+
+        # 도메인명 추출 (category에서)
+        cat_match = re.search(r'category:\s*도메인/(.+)', raw)
+        domain_name = cat_match.group(1).strip() if cat_match else f"도메인_{len(existing) + 1}"
+        # 파일명에 사용할 수 없는 문자 제거
+        safe_name = re.sub(r'[\\/:*?"<>|]', '_', domain_name)
+
+        out_path = domain_dir / f"{safe_name}.md"
+        out_path.write_text(raw.strip(), encoding='utf-8')
+        log(f"도메인 승급: {safe_name} ({len(cluster)}개 문서 종합)")
+
+    # 도메인 문서 포함하여 벡터 인덱스 재구축
+    log("도메인 반영 — 벡터 인덱스 갱신 중...")
+    update_vector_index(context_dir, base_dir)
+    log("벡터 인덱스 갱신 완료")
 
 
 # 기본 모델 (config.json의 claude_model로 오버라이드 가능)
@@ -1183,12 +1481,14 @@ def main():
     log(f"리뷰 저장: {reviews_dir}")
     print()
 
+    # 초기 컨텍스트 생성 (최초 실행 시 전체 소스 분석, 중단 재실행 시 누락분 보충)
+    initial_context_build(repo_dir, context_dir, base_dir, use_gemini=use_gemini)
+
     last_hash = load_state(base_dir) or get_local_hash(repo_dir)
     save_state(base_dir, last_hash)
 
-    # 최초 실행 또는 인덱스 없을 때 전체 벡터 인덱싱
+    # 컨텍스트 MD는 있지만 벡터 DB가 없는 경우 대비 (DB 삭제 등)
     if _server_mode:
-        # 서버 모드: HTTP API로 상태 확인 후 필요시 rebuild
         status = _http_get("/api/v1/index/status")
         if status and status.get("indexed_documents", 0) == 0:
             log("벡터 인덱스 초기 구축 중...")
@@ -1201,8 +1501,17 @@ def main():
 
     log("감시 시작... (종료: Ctrl+C)")
 
+    poll_count = 0
     while True:
+        poll_count += 1
         try:
+            # 주기적 도메인 승급 체크
+            if poll_count % DOMAIN_CHECK_INTERVAL == 0:
+                try:
+                    promote_domains(base_dir, context_dir, use_gemini=use_gemini)
+                except Exception as e:
+                    log(f"[경고] 도메인 체크 오류: {e}")
+
             if not git_fetch(repo_dir):
                 log("[경고] git fetch 실패, 재시도 대기 중...")
             else:

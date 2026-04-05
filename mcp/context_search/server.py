@@ -129,6 +129,27 @@ def _remote_get(endpoint: str) -> str:
 
 
 # ─────────────────────────────────────────
+# 검색 로그
+# ─────────────────────────────────────────
+
+def _log_search(project_root: str, result_files: list[str]):
+    """검색 결과 문서 ID를 로그에 기록한다 (도메인 자동 승급용)."""
+    if not result_files or len(result_files) < 2:
+        return
+    from datetime import datetime
+    log_path = Path(project_root) / ".claude" / "search_log.jsonl"
+    try:
+        entry = json.dumps({
+            "ts": datetime.now().isoformat(),
+            "results": result_files,
+        }, ensure_ascii=False)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(entry + "\n")
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────
 # 공통 파서
 # ─────────────────────────────────────────
 
@@ -432,6 +453,9 @@ def combined_search(query: str, project_root: str = ".", tags: list[str] | None 
         merged.values(),
         key=lambda x: (source_order.get(x["source"], 9), -x.get("similarity", 0)),
     )
+
+    # 검색 로그 기록 (도메인 자동 승급용)
+    _log_search(project_root, [r["file"] for r in sorted_results])
 
     return json.dumps({
         "query": query,
@@ -920,6 +944,9 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
             merged.values(),
             key=lambda x: (source_order.get(x["source"], 9), -x.get("similarity", 0)),
         )
+        # 검색 로그 기록
+        _log_search(project_root, [r["file"] for r in sorted_results])
+
         return {
             "query": req.query,
             "tags_used": sorted(collected_tags),

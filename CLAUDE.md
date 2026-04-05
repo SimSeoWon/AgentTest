@@ -137,11 +137,22 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
   - 마커가 없으면 파일 끝에 추가, 있으면 해당 구역만 최신 내용으로 교체
   - 마커 외부(사용자 작성 내용)는 절대 건드리지 않음
 
+**초기 컨텍스트 빌드 (`initial_context_build`)**
+- 최초 설치 시 또는 누락분이 있을 때 자동 실행
+- `git ls-files`로 추적 중인 모든 소스 파일을 수집 (`_list_all_source_files`)
+- `_group_by_directory`로 디렉토리(모듈) 단위 그룹핑
+- 이미 컨텍스트 MD가 존재하는 모듈은 건너뜀 (중단 후 재실행 시 누락분만 보충)
+- `_process_directory_group`으로 병렬 LLM 호출 (컨텍스트만, 리뷰 없음)
+- 완료 후 벡터 인덱스 전체 구축 (`update_vector_index` rebuild)
+- 10개 모듈마다 진행률 로그 출력
+
 **감시 루프**
 - `git fetch` → remote 해시와 local 해시 비교
 - 변경 감지 시: `git pull` → `git diff --name-only` → `process_commit()` 실행
-  1. **컨텍스트+리뷰 통합 처리** (`process_commit`) — 변경 파일을 **디렉토리(모듈) 단위**로 묶어 **1회의 LLM 호출**로 컨텍스트 MD 생성 + 코드 리뷰를 동시 수행 (병렬 6워커)
-     - 같은 디렉토리의 `.h`/`.cpp` 파일을 합쳐서 하나의 MD로 생성 (예: `TaskSystem.md`)
+  1. **컨텍스트+리뷰 통합 처리** (`process_commit`) — 변경 파일을 그룹핑 후 **1회의 LLM 호출**로 컨텍스트 MD 생성 + 코드 리뷰를 동시 수행 (병렬 6워커)
+     - **적응형 그룹핑** (`_group_files`): 디렉토리 단위로 묶되, 합산 크기가 `GROUP_CONTENT_LIMIT`(8000자) 초과 시 파일명(stem) 단위로 분할
+     - 소규모 디렉토리: 전체를 하나의 MD로 합침 (예: `Mission.md`)
+     - 대규모 디렉토리: 같은 이름의 `.h`/`.cpp`만 묶어 별도 MD (예: `TaskSystem.md`, `MissionManager.md`)
      - `.h`를 먼저, `.cpp`를 뒤에 배치하여 인터페이스→구현 순서로 분석
      - 그룹당 최대 8000자 (`GROUP_CONTENT_LIMIT`)
      - `auto_review: false` 시 컨텍스트 MD만 생성
@@ -152,6 +163,16 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 - 소스 대상 확장자: `.cpp`, `.h`, `.hpp`, `.inl`, `.cs`, `.py`
 - 에셋 대상 확장자: `.uasset`, `.umap`
 - `.watch_state` 파일로 마지막 커밋 해시 영속 저장 (멱등성 보장)
+- **도메인 자동 승급**: 매 10회 폴링마다 `promote_domains()` 실행 (아래 상세)
+
+**도메인 자동 승급 (데이터 → 정보)**
+- 검색 로그(`.claude/search_log.jsonl`)를 분석하여 자주 함께 검색되는 문서 클러스터를 식별
+- `_analyze_search_patterns()`: 동시 출현 빈도 ≥ 5회인 문서 쌍으로 그래프 구축, Union-Find로 클러스터링
+- `promote_domains()`: 클러스터 내 문서들을 LLM으로 종합하여 도메인 문서 생성
+- 저장: `.claude/context/_domains/<도메인명>.md` → 벡터 인덱싱에 자동 포함
+- 기존 도메인과 80% 이상 겹치면 중복 생성 방지
+- `context_search.exe`의 `combined_search` 호출 시 결과 문서 ID가 자동 로깅됨
+- 도메인 문서 스키마: `type: domain`, `source_documents` 목록, 시스템 개요/클래스 관계/데이터 흐름/설계 패턴 포함
 
 **코드 리뷰 흐름 (컨텍스트 생성과 통합)**
 - 컨텍스트 MD 생성과 코드 리뷰를 **1회의 LLM 호출**로 동시 수행
