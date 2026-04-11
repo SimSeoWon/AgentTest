@@ -1135,6 +1135,7 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
 
     @app.post("/api/v1/search/vector")
     def api_vector_search(req: VectorSearchReq):
+        _cs_log(f"벡터 검색: query=\"{req.query}\" n={req.n_results}")
         collection = _index.live
         count = collection.count()
         if count == 0:
@@ -1166,10 +1167,12 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                 "related_classes": rc,
                 "content_preview": (results["documents"][0][i] or "")[:500],
             })
+        _cs_log(f"벡터 검색 완료: {len(output)}건")
         return {"query": req.query, "count": len(output), "results": output}
 
     @app.post("/api/v1/search/tags")
     def api_tag_search(req: TagSearchReq):
+        _cs_log(f"태그 검색: tags={req.tags}")
         search_tags = {t.strip().lower() for t in req.tags}
         results = []
         for file, entry in _index.tag_cache.items():
@@ -1184,10 +1187,12 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                     "matched_tags": list(matched),
                     "body": entry.get("body", ""),
                 })
+        _cs_log(f"태그 검색 완료: {len(results)}건")
         return {"count": len(results), "results": results}
 
     @app.post("/api/v1/search/combined")
     def api_combined_search(req: CombinedSearchReq):
+        _cs_log(f"통합 검색: query=\"{req.query}\" n={req.n_results} tags={req.tags}")
         merged = {}
 
         # 1) 벡터 검색 (Live 컬렉션)
@@ -1269,6 +1274,7 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
         # 검색 로그 기록
         _log_search(project_root, [r["file"] for r in sorted_results])
 
+        _cs_log(f"통합 검색 완료: {len(sorted_results)}건")
         return {
             "query": req.query,
             "tags_used": sorted(collected_tags),
@@ -1302,6 +1308,7 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
 
     @app.post("/api/v1/index/upsert")
     def api_upsert(req: UpsertReq):
+        _cs_log(f"인덱스 upsert: {len(req.files)}개 파일")
         context_dir = Path(project_root) / ".claude" / "context"
         try:
             work_coll = _index.begin_update(fresh=False)
@@ -1330,13 +1337,16 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                 work_coll.upsert(ids=ids, documents=documents, metadatas=metadatas)
 
             _index.commit_update()
+            _cs_log(f"인덱스 upsert 완료: {len(ids)}건")
             return {"status": "완료", "upserted_files": len(ids)}
         except Exception as e:
             _index.rollback_update()
+            _cs_log(f"인덱스 upsert 실패: {e}")
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     @app.post("/api/v1/index/rebuild")
     def api_rebuild():
+        _cs_log("인덱스 전체 재구축 시작")
         context_dir = Path(project_root) / ".claude" / "context"
         if not context_dir.exists():
             return {"error": f"컨텍스트 디렉토리가 없습니다: {context_dir}"}
@@ -1371,9 +1381,11 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                     )
 
             _index.commit_update()
+            _cs_log(f"인덱스 재구축 완료: {len(ids)}건")
             return {"status": "완료", "indexed_files": len(ids)}
         except Exception as e:
             _index.rollback_update()
+            _cs_log(f"인덱스 재구축 실패: {e}")
             return JSONResponse(status_code=500, content={"error": str(e)})
 
     # ── 서버 시작 ──
