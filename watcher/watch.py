@@ -267,6 +267,9 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
         url_raw = input("원격 RAG 서버 URL (없으면 Enter, 예: http://192.168.1.100:8100): ").strip()
         context_server_url = url_raw
 
+    enable_log_raw = input("파일 로그 활성화 (기본값: y) [y/n]: ").strip().lower()
+    enable_log = enable_log_raw != 'n'
+
     config = {
         "branch": branch,
         "poll_interval": poll_interval,
@@ -278,6 +281,7 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
         "server_host": server_host,
         "server_port": server_port,
         "context_server_url": context_server_url,
+        "enable_log": enable_log,
         "repo_dir": str(repo_dir),
     }
 
@@ -382,6 +386,9 @@ def main():
     # Claude 모델 설정 (기본값: sonnet -- 속도와 품질의 균형)
     claude_model = config.get("claude_model", "claude-sonnet-4-6")
     common.set_claude_model(claude_model)
+
+    # ── 파일 로그 설정 ──
+    common.init_log(base_dir, config.get("enable_log", True))
 
     # ── 서버 모드 설정 ──
     common._server_mode = config.get("server_mode", False)

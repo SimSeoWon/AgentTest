@@ -229,6 +229,7 @@ gemini -y <prompt>
   "server_host": "0.0.0.0",
   "server_port": 8100,
   "context_server_url": "",
+  "enable_log": true,
   "repo_dir": "..."
 }
 ```
@@ -239,6 +240,12 @@ gemini -y <prompt>
 | `server_host` | 바인드 주소 | `"0.0.0.0"` | 미사용 |
 | `server_port` | HTTP 포트 | `8100` | 미사용 |
 | `context_server_url` | 원격 서버 URL | `""` (자기 자신) | `"http://<서버IP>:8100"` |
+| `enable_log` | 파일 로그 활성화 | `true` (기본) | `true` (기본) |
+
+**파일 로그**
+- 경로: `.claude/logs/watch_YYYY-MM-DD.log` (날짜별 로테이션)
+- 보관: 7일 (`LOG_RETENTION_DAYS`), 초과 시 자동 삭제
+- 콘솔 출력과 동일한 내용이 파일에도 기록됨
 
 ### 2. `watcher/agent_templates.py`
 

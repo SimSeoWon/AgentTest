@@ -17,6 +17,7 @@ import json
 import shutil
 import threading
 from pathlib import Path
+from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
 # 벡터 검색 의존성 (없으면 태그 검색만 제공)
@@ -51,6 +52,44 @@ def _ensure_onnx_model():
 
 if VECTOR_AVAILABLE:
     _ensure_onnx_model()
+
+
+# ─────────────────────────────────────────
+# 로깅 (watch.log와 동일 폴더에 기록)
+# ─────────────────────────────────────────
+
+_cs_log_file = None
+_cs_log_date = ""
+
+def _get_log_dir() -> Path | None:
+    """프로젝트 루트의 .claude/logs/ 경로를 반환한다."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys.executable).parent.parent.parent
+    else:
+        base = Path(__file__).parent.parent.parent
+    log_dir = base / ".claude" / "logs"
+    return log_dir
+
+
+def _cs_log(msg: str):
+    """context_search 로그를 파일에 기록한다."""
+    global _cs_log_file, _cs_log_date
+    log_dir = _get_log_dir()
+    if not log_dir:
+        return
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        if today != _cs_log_date:
+            if _cs_log_file:
+                _cs_log_file.close()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            _cs_log_date = today
+            _cs_log_file = open(log_dir / f"context_search_{today}.log", 'a', encoding='utf-8')
+        if _cs_log_file:
+            _cs_log_file.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+            _cs_log_file.flush()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────
@@ -104,6 +143,7 @@ def _cache_search_results(results: list[dict]):
     cache_dir = _get_cache_dir()
     if not cache_dir:
         return
+    _cs_log(f"캐시 저장: {len(results)}개 문서")
     for r in results:
         file_path = r.get("file", "")
         if not file_path:
@@ -131,8 +171,10 @@ def _cache_search_results(results: list[dict]):
 
 def _fallback_tag_search(query: str, n_results: int = 5) -> str:
     """서버 미응답 시 캐싱된 MD에서 태그 기반 검색을 수행한다."""
+    _cs_log(f"[폴백] 로컬 캐시 태그 검색: query={query}")
     cache_dir = _get_cache_dir()
     if not cache_dir or not cache_dir.exists():
+        _cs_log("[폴백] 로컬 캐시 없음")
         return json.dumps({"error": "로컬 캐시 없음", "results": []}, ensure_ascii=False)
 
     query_tokens = {t.strip().lower() for t in re.split(r'[\s,/]+', query) if t.strip()}
@@ -181,10 +223,14 @@ def _remote_post(endpoint: str, payload: dict) -> str:
         url, data=data,
         headers={"Content-Type": "application/json; charset=utf-8"},
     )
+    _cs_log(f"서버 요청: POST {endpoint}")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read().decode("utf-8")
+            result = resp.read().decode("utf-8")
+            _cs_log(f"서버 응답: {endpoint} OK")
+            return result
     except urllib.error.URLError as e:
+        _cs_log(f"서버 연결 실패: {endpoint} → {e}")
         return json.dumps({
             "error": f"컨텍스트 서버 연결 실패: {e}",
             "server_url": url,

@@ -31,13 +31,67 @@ _server_proc = None  # context_search --serve 프로세스
 # 기본 모델 (config.json의 claude_model로 오버라이드 가능)
 _claude_model: str = "claude-sonnet-4-6"
 
+# 로그 설정
+_log_enabled: bool = True
+_log_dir: Path | None = None
+_log_file = None  # 현재 열려 있는 로그 파일 핸들
+_log_date: str = ""  # 현재 로그 파일의 날짜 (로테이션 체크용)
+LOG_RETENTION_DAYS = 7  # 로그 보관 일수
+
 
 # ─────────────────────────────────────────
 # 로깅
 # ─────────────────────────────────────────
 
+def init_log(base_dir: Path, enabled: bool = True):
+    """로그 시스템을 초기화한다. main()에서 호출."""
+    global _log_enabled, _log_dir
+    _log_enabled = enabled
+    if not _log_enabled:
+        return
+    _log_dir = base_dir / ".claude" / "logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_old_logs()
+
+
+def _get_log_file():
+    """날짜별 로그 파일 핸들을 반환한다. 날짜가 바뀌면 새 파일로 로테이션."""
+    global _log_file, _log_date
+    if not _log_enabled or not _log_dir:
+        return None
+    today = datetime.now().strftime('%Y-%m-%d')
+    if today != _log_date:
+        if _log_file:
+            _log_file.close()
+        _log_date = today
+        log_path = _log_dir / f"watch_{today}.log"
+        _log_file = open(log_path, 'a', encoding='utf-8')
+    return _log_file
+
+
+def _cleanup_old_logs():
+    """보관 기간이 지난 로그 파일을 삭제한다."""
+    if not _log_dir or not _log_dir.exists():
+        return
+    from datetime import timedelta
+    cutoff = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
+    for log_file in _log_dir.glob("watch_*.log"):
+        try:
+            date_str = log_file.stem.replace("watch_", "")
+            file_date = datetime.strptime(date_str, '%Y-%m-%d')
+            if file_date < cutoff:
+                log_file.unlink()
+        except (ValueError, OSError):
+            pass
+
+
 def log(msg: str):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    f = _get_log_file()
+    if f:
+        f.write(line + "\n")
+        f.flush()
 
 
 # ─────────────────────────────────────────
