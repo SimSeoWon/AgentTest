@@ -292,7 +292,7 @@ gemini -y <prompt>
 
 | 서버 | 빌드 산출물 | 제공 툴 | 사용 에이전트 |
 |------|------------|---------|-------------|
-| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status`, `impact_analysis` | 02, 03, 04, 05, 07, 08, 09, 10 |
+| `context_search` | `mcp/context_search.exe` | `combined_search`, `search_context`, `list_tags`, `vector_search`, `rebuild_index`, `index_status`, `impact_analysis`, `cache_context` | 02, 03, 04, 05, 07, 08, 09, 10 |
 | `log_analyzer` | `mcp/log_analyzer.exe` | `analyze_log`, `search_log` | 08 |
 | `crash_analyzer` | `mcp/crash_analyzer.exe` | `analyze_crash`, `analyze_crash_log` | 09 |
 | `commandlet_runner` | `mcp/commandlet_runner.exe` | `find_unreal_editor`, `run_data_validation`, `run_commandlet` | 10 |
@@ -353,6 +353,12 @@ RAG는 **진실의 원천(source of truth)이 아니라 네비게이션**이다.
 실제 소스코드가 항상 최신 상태를 담고 있으며, RAG의 역할은 **"어디를 봐야 하는지"를 안내하는 메타데이터 인덱스**다.
 에이전트는 RAG 검색 결과를 기반으로 관련 소스 파일을 찾은 뒤, **실제 코드를 직접 읽고 판단**한다.
 따라서 RAG에 시간 순서나 정보 간 우선순위가 없어도 실질적 문제가 되지 않는다.
+
+### 에이전트 행동 원칙 (필수)
+1. **모든 판단은 소스 코드 기준** — RAG 검색 결과와 소스 코드가 다르면, 소스 코드가 정답이다. RAG 결과를 근거로 제안하거나 판단하지 말 것.
+2. **RAG는 참조만** — `combined_search` 결과의 `related_classes`, `tags`, `category`는 탐색 힌트일 뿐. 해당 파일을 반드시 `Read`로 직접 확인한 후 판단할 것.
+3. **탐색 결과 캐시 저장** — 소스 코드를 직접 탐색(Glob/Grep/Read)하여 유의미한 파일을 발견하면, `cache_context` 도구로 태그·카테고리·관련 클래스를 저장할 것. 이후 동일한 검색에서 폴백 캐시로 활용된다.
+4. **캐시도 검증 대상** — `cache_context`로 저장된 내용도 시간이 지나면 소스와 달라질 수 있다. 캐시 기반 검색 결과도 반드시 소스 코드로 재확인할 것.
 
 ### 통합 검색 (`combined_search`)
 에이전트는 **항상 `combined_search`를 우선 사용**한다. 이 툴은 내부적으로:

@@ -32,6 +32,8 @@ pyinstaller -y ^
     --hidden-import=uvicorn.loops.auto ^
     --hidden-import=uvicorn.protocols.http.auto ^
     --hidden-import=uvicorn.lifespan.on ^
+    --hidden-import=web_ui ^
+    --paths "mcp/context_search" ^
     mcp/context_search/server.py
 
 echo.

@@ -209,6 +209,16 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
         with open(config_path, encoding='utf-8') as f:
             config = json.load(f)
         if config.get("branch") and config.get("poll_interval"):
+            # 타입/범위 검증
+            try:
+                config["poll_interval"] = max(10, int(config["poll_interval"]))
+            except (ValueError, TypeError):
+                config["poll_interval"] = 60
+            if config.get("server_port"):
+                try:
+                    config["server_port"] = int(config["server_port"])
+                except (ValueError, TypeError):
+                    config["server_port"] = 8100
             return config
 
     print("=" * 50)
@@ -323,11 +333,24 @@ def get_local_hash(repo_dir: Path) -> str:
 def git_pull(repo_dir: Path, branch: str) -> bool:
     result = subprocess.run(
         ["git", "pull", "origin", branch],
-        cwd=repo_dir, capture_output=True, text=True
+        cwd=repo_dir, capture_output=True, text=True,
+        encoding='utf-8', errors='replace',
     )
-    if result.returncode != 0:
-        print(f"[오류] git pull 실패:\n{result.stderr}")
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+
+    stderr = result.stderr or ""
+    # 상태별 안내 메시지
+    if "CONFLICT" in stderr or "CONFLICT" in (result.stdout or ""):
+        common.log("[오류] git pull 실패: merge conflict 발생")
+        common.log("  → 수동으로 충돌을 해결한 뒤 watch.exe를 재시작하세요.")
+        common.log("  → git status 로 충돌 파일 확인 가능")
+    elif "local changes" in stderr.lower() or "uncommitted" in stderr.lower():
+        common.log("[오류] git pull 실패: 로컬 변경사항이 있습니다")
+        common.log("  → git stash 또는 git commit 후 재시작하세요.")
+    else:
+        common.log(f"[오류] git pull 실패:\n{stderr[:300]}")
+    return False
 
 
 def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]:
@@ -344,11 +367,11 @@ def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]
 
 def load_state(base_dir: Path) -> str | None:
     state_path = base_dir / common.STATE_FILE
-    return state_path.read_text().strip() if state_path.exists() else None
+    return state_path.read_text(encoding='utf-8').strip() if state_path.exists() else None
 
 
 def save_state(base_dir: Path, commit_hash: str):
-    (base_dir / common.STATE_FILE).write_text(commit_hash)
+    (base_dir / common.STATE_FILE).write_text(commit_hash, encoding='utf-8')
 
 
 # ─────────────────────────────────────────
@@ -498,7 +521,9 @@ def main():
                         try:
                             common.log(f"새 커밋 감지: {last_hash[:8]} → {remote_hash[:8]}")
 
-                            if git_pull(repo_dir, branch):
+                            if not git_pull(repo_dir, branch):
+                                common.log(f"  다음 폴링에서 재시도합니다. ({poll_interval}초 후)")
+                            else:
                                 # pull 후 실제 최신 해시 재확인 (작업 중 추가 커밋 대응)
                                 actual_hash = get_local_hash(repo_dir)
                                 if actual_hash != remote_hash:
