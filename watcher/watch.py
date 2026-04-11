@@ -167,19 +167,23 @@ def find_git_repo(base_dir: Path) -> Path:
 # 방화벽
 # ─────────────────────────────────────────
 
-def _setup_firewall(port: int):
-    """Windows 방화벽 인바운드 규칙을 확인하고 없으면 추가한다."""
-    rule_name = f"AgentWatch Context Server (TCP {port})"
-    # 기존 규칙 확인
+def _firewall_rule_name(port: int) -> str:
+    return f"AgentWatch Context Server (TCP {port})"
+
+
+def _check_firewall_exists(port: int) -> bool:
+    """Windows 방화벽에 해당 포트의 인바운드 규칙이 있는지 확인한다."""
+    rule_name = _firewall_rule_name(port)
     check = subprocess.run(
         ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
         capture_output=True, text=True, encoding='utf-8', errors='replace',
     )
-    if check.returncode == 0 and rule_name in check.stdout:
-        print(f"  방화벽 규칙이 이미 존재합니다: {rule_name}")
-        return
+    return check.returncode == 0 and rule_name in check.stdout
 
-    # 관리자 권한으로 규칙 추가
+
+def _setup_firewall(port: int):
+    """Windows 방화벽 인바운드 규칙을 추가한다."""
+    rule_name = _firewall_rule_name(port)
     print(f"  방화벽 규칙 추가 중... (관리자 권한 필요)")
     result = subprocess.run(
         ["netsh", "advfirewall", "firewall", "add", "rule",
@@ -385,6 +389,11 @@ def main():
     server_host = config.get("server_host", "0.0.0.0")
 
     if common._server_mode:
+        # 방화벽 규칙 확인 (Windows)
+        if sys.platform == 'win32' and not _check_firewall_exists(server_port):
+            fw_raw = input(f"방화벽 인바운드 포트 {server_port} 설정을 확인해보시겠습니까? (y/n): ").strip().lower()
+            if fw_raw == 'y':
+                _setup_firewall(server_port)
         common._server_url = f"http://localhost:{server_port}"
         # context_search HTTP 서버를 백그라운드 프로세스로 시작
         cmd = _get_context_search_cmd(base_dir)
