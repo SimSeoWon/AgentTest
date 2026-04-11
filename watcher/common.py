@@ -13,7 +13,7 @@ from datetime import datetime
 # 상수
 # ─────────────────────────────────────────
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 CONFIG_FILE = "config.json"
 STATE_FILE = ".watch_state"
 TARGET_EXTENSIONS = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}
@@ -164,14 +164,16 @@ def _call_claude(prompt: str) -> str | None:
 
 def _call_gemini(prompt: str) -> str | None:
     """Gemini CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None. (폴백은 _call_llm에서 처리)"""
-    if not shutil.which("gemini"):
+    gemini_path = shutil.which("gemini")
+    if not gemini_path:
         log("[경고] Gemini CLI를 찾을 수 없음")
         return None
     try:
         result = subprocess.run(
-            ["gemini", "-y"],
+            [gemini_path, "-y"],
             input=prompt,
             capture_output=True, text=True, encoding='utf-8', errors='replace',
+            shell=True,
         )
     except OSError as e:
         log(f"[오류] Gemini 실행 실패: {e}")
