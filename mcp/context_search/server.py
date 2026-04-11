@@ -89,6 +89,88 @@ def _is_remote_mode() -> bool:
     return bool(_SERVER_URL)
 
 
+def _get_cache_dir() -> Path | None:
+    """클라이언트 캐시 디렉토리(context/)를 반환한다."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys.executable).parent.parent.parent
+    else:
+        base = Path(__file__).parent.parent.parent
+    cache_dir = base / ".claude" / "context"
+    return cache_dir
+
+
+def _cache_search_results(results: list[dict]):
+    """검색 결과를 로컬 MD 파일로 캐싱한다. (related_classes, category, tags)"""
+    cache_dir = _get_cache_dir()
+    if not cache_dir:
+        return
+    for r in results:
+        file_path = r.get("file", "")
+        if not file_path:
+            continue
+        md_path = cache_dir / file_path
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+
+        tags = r.get("tags", [])
+        category = r.get("category", "")
+        related = r.get("related_classes", {})
+
+        lines = ["---"]
+        lines.append(f"tags: [{', '.join(tags)}]")
+        if category:
+            lines.append(f"category: {category}")
+        if related:
+            lines.append("related_classes:")
+            for cls_name, cls_path in related.items():
+                lines.append(f"  - {cls_name}: {cls_path}")
+        lines.append("---")
+        lines.append("")
+
+        md_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _fallback_tag_search(query: str, n_results: int = 5) -> str:
+    """서버 미응답 시 캐싱된 MD에서 태그 기반 검색을 수행한다."""
+    cache_dir = _get_cache_dir()
+    if not cache_dir or not cache_dir.exists():
+        return json.dumps({"error": "로컬 캐시 없음", "results": []}, ensure_ascii=False)
+
+    query_tokens = {t.strip().lower() for t in re.split(r'[\s,/]+', query) if t.strip()}
+    if not query_tokens:
+        return json.dumps({"results": []}, ensure_ascii=False)
+
+    results = []
+    for md_file in cache_dir.rglob("*.md"):
+        if md_file.name.startswith("_"):
+            continue
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        meta = _parse_frontmatter(content)
+        file_tags = {t.lower() for t in meta.get("tags", [])}
+        matched = query_tokens & file_tags
+        if matched:
+            results.append({
+                "file": str(md_file.relative_to(cache_dir)).replace("\\", "/"),
+                "similarity": 0,
+                "category": meta.get("category", ""),
+                "tags": list(file_tags),
+                "related_classes": meta.get("related_classes", {}),
+                "source": "cache",
+                "matched_tags": list(matched),
+            })
+
+    results.sort(key=lambda x: -len(x.get("matched_tags", [])))
+    results = results[:n_results]
+    return json.dumps({
+        "query": query,
+        "count": len(results),
+        "results": results,
+        "fallback": True,
+    }, ensure_ascii=False, indent=2)
+
+
 def _remote_post(endpoint: str, payload: dict) -> str:
     """중앙 서버에 POST 요청을 보내고 JSON 문자열을 반환한다."""
     import urllib.request
@@ -316,10 +398,18 @@ def vector_search(query: str, project_root: str = ".", n_results: int = 5, categ
         category_filter: 카테고리 필터 (예: "전투"). 빈 문자열이면 전체 검색
     """
     if _is_remote_mode():
-        return _remote_post("/api/v1/search/vector", {
+        raw = _remote_post("/api/v1/search/vector", {
             "query": query, "n_results": n_results,
             "category_filter": category_filter,
         })
+        try:
+            data = json.loads(raw)
+            if "error" not in data and data.get("results"):
+                _cache_search_results(data["results"])
+                return raw
+            return _fallback_tag_search(query, n_results)
+        except Exception:
+            return _fallback_tag_search(query, n_results)
 
     if not VECTOR_AVAILABLE:
         return json.dumps({"error": "chromadb가 설치되어 있지 않습니다. pip install chromadb"}, ensure_ascii=False)
@@ -351,11 +441,15 @@ def vector_search(query: str, project_root: str = ".", n_results: int = 5, categ
     for i in range(len(results["ids"][0])):
         dist = results["distances"][0][i]
         similarity = round(1.0 - dist, 4)  # cosine distance → similarity
+        meta = results["metadatas"][0][i]
+        rc_raw = meta.get("related_classes", "")
+        rc = json.loads(rc_raw) if rc_raw else {}
         output.append({
             "file": results["ids"][0][i],
             "similarity": similarity,
-            "category": results["metadatas"][0][i].get("category", ""),
-            "tags": [t for t in results["metadatas"][0][i].get("tags", "").split(",") if t],
+            "category": meta.get("category", ""),
+            "tags": [t for t in meta.get("tags", "").split(",") if t],
+            "related_classes": rc,
             "content_preview": (results["documents"][0][i] or "")[:500],
         })
 
@@ -380,10 +474,19 @@ def combined_search(query: str, project_root: str = ".", tags: list[str] | None 
         category_filter: 카테고리 필터 (빈 문자열이면 전체 검색)
     """
     if _is_remote_mode():
-        return _remote_post("/api/v1/search/combined", {
+        raw = _remote_post("/api/v1/search/combined", {
             "query": query, "tags": tags, "n_results": n_results,
             "category_filter": category_filter,
         })
+        try:
+            data = json.loads(raw)
+            if "error" not in data and data.get("results"):
+                _cache_search_results(data["results"])
+                return raw
+            # 서버 응답 실패 → 로컬 캐시 폴백
+            return _fallback_tag_search(query, n_results)
+        except Exception:
+            return _fallback_tag_search(query, n_results)
 
     merged: dict[str, dict] = {}  # file -> result
 
@@ -403,6 +506,7 @@ def combined_search(query: str, project_root: str = ".", tags: list[str] | None 
             "similarity": r.get("similarity", 0),
             "category": r.get("category", ""),
             "tags": r.get("tags", []),
+            "related_classes": r.get("related_classes", {}),
             "source": "vector",
             "content_preview": r.get("content_preview", ""),
         }
@@ -429,11 +533,13 @@ def combined_search(query: str, project_root: str = ".", tags: list[str] | None 
     for r in tag_results:
         f = r["file"]
         if f in merged:
-            # 이미 벡터 검색에 있으면 source를 both로 갱신, 태그 보강
+            # 이미 벡터 검색에 있으면 source를 both로 갱신, 태그/related_classes 보강
             merged[f]["source"] = "both"
             existing_tags = set(merged[f].get("tags", []))
             existing_tags.update(r.get("tags", []))
             merged[f]["tags"] = list(existing_tags)
+            if not merged[f].get("related_classes"):
+                merged[f]["related_classes"] = r.get("related_classes", {})
             if not merged[f].get("content_preview"):
                 merged[f]["content_preview"] = r.get("body", "")[:500]
         else:
@@ -442,6 +548,7 @@ def combined_search(query: str, project_root: str = ".", tags: list[str] | None 
                 "similarity": 0,
                 "category": r.get("category", ""),
                 "tags": r.get("tags", []),
+                "related_classes": r.get("related_classes", {}),
                 "matched_tags": r.get("matched_tags", []),
                 "source": "tag",
                 "content_preview": r.get("body", "")[:500],
@@ -518,9 +625,11 @@ def rebuild_index(project_root: str = ".") -> str:
         doc_id = str(md_file.relative_to(context_dir)).replace("\\", "/")
         ids.append(doc_id)
         documents.append(body)
+        rc = meta.get("related_classes", {})
         metadatas.append({
             "tags": ",".join(meta.get("tags", [])),
             "category": meta.get("category", ""),
+            "related_classes": json.dumps(rc, ensure_ascii=False) if rc else "",
         })
 
     if not ids:
@@ -698,9 +807,11 @@ def _upsert_files(project_root: str, md_relative_paths: list[str]) -> str:
             continue
         ids.append(rel_path.replace("\\", "/"))
         documents.append(body)
+        rc = meta.get("related_classes", {})
         metadatas.append({
             "tags": ",".join(meta.get("tags", [])),
             "category": meta.get("category", ""),
+            "related_classes": json.dumps(rc, ensure_ascii=False) if rc else "",
         })
 
     if ids:
@@ -945,11 +1056,15 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
         output = []
         for i in range(len(results["ids"][0])):
             dist = results["distances"][0][i]
+            meta = results["metadatas"][0][i]
+            rc_raw = meta.get("related_classes", "")
+            rc = json.loads(rc_raw) if rc_raw else {}
             output.append({
                 "file": results["ids"][0][i],
                 "similarity": round(1.0 - dist, 4),
-                "category": results["metadatas"][0][i].get("category", ""),
-                "tags": [t for t in results["metadatas"][0][i].get("tags", "").split(",") if t],
+                "category": meta.get("category", ""),
+                "tags": [t for t in meta.get("tags", "").split(",") if t],
+                "related_classes": rc,
                 "content_preview": (results["documents"][0][i] or "")[:500],
             })
         return {"query": req.query, "count": len(output), "results": output}
@@ -992,11 +1107,15 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                 )
                 for i in range(len(raw["ids"][0])):
                     dist = raw["distances"][0][i]
+                    meta = raw["metadatas"][0][i]
+                    rc_raw = meta.get("related_classes", "")
+                    rc = json.loads(rc_raw) if rc_raw else {}
                     vector_results.append({
                         "file": raw["ids"][0][i],
                         "similarity": round(1.0 - dist, 4),
-                        "category": raw["metadatas"][0][i].get("category", ""),
-                        "tags": [t for t in raw["metadatas"][0][i].get("tags", "").split(",") if t],
+                        "category": meta.get("category", ""),
+                        "tags": [t for t in meta.get("tags", "").split(",") if t],
+                        "related_classes": rc,
                         "content_preview": (raw["documents"][0][i] or "")[:500],
                     })
             except Exception:
@@ -1025,6 +1144,8 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                         existing = set(merged[file].get("tags", []))
                         existing.update(entry.get("tags", []))
                         merged[file]["tags"] = list(existing)
+                        if not merged[file].get("related_classes"):
+                            merged[file]["related_classes"] = entry.get("related_classes", {})
                         if not merged[file].get("content_preview"):
                             merged[file]["content_preview"] = entry.get("body", "")[:500]
                     else:
@@ -1032,6 +1153,7 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
                             "file": file, "similarity": 0,
                             "category": entry.get("category", ""),
                             "tags": entry.get("tags", []),
+                            "related_classes": entry.get("related_classes", {}),
                             "matched_tags": list(matched),
                             "source": "tag",
                             "content_preview": entry.get("body", "")[:500],

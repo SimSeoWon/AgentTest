@@ -375,7 +375,7 @@ watch.exe → context MD 생성 → context_search.exe --upsert 호출 → Chrom
 | 모드 | 실행 방법 | 설명 |
 |------|-----------|------|
 | **서버** | `--serve <root> [port] [host]` | FastAPI HTTP 서버, DoubleBufferedIndex로 무중단 인덱싱 |
-| **클라이언트** | MCP stdio + `context_server_url` 설정 | HTTP로 중앙 서버에 위임 |
+| **클라이언트** | MCP stdio + `context_server_url` 설정 | HTTP로 중앙 서버에 위임, 결과를 로컬 MD로 캐싱, 서버 미응답 시 캐시에서 태그 검색 폴백 |
 | **로컬** | MCP stdio (기본) | 기존 ChromaDB 직접 사용 |
 
 ```
@@ -399,6 +399,13 @@ context_search.exe                                            MCP 서버 모드 
 | POST | `/api/v1/index/rebuild` | 전체 재구축 | Work → 교체 |
 | GET | `/api/v1/index/status` | 인덱스 상태 | Live |
 | GET | `/api/v1/health` | 서버 상태 | - |
+| GET | `/` | 웹 UI (문서 목록/검색/태그 시각화) | - |
+
+### 클라이언트 캐시 및 폴백
+- 서버 검색(`combined_search`, `vector_search`) 응답 성공 시 → 결과를 `.claude/context/<file>.md`에 캐싱 (tags, category, related_classes)
+- 서버 미응답 시 → 캐싱된 MD에서 태그 기반 검색으로 폴백 (`_fallback_tag_search`)
+- 캐시 MD에는 본문(content_preview)은 저장하지 않음 — 메타데이터만 보존
+- 캐시는 검색할 때마다 갱신되므로 별도 동기화 불필요
 
 ### 더블 버퍼링 (DoubleBufferedIndex)
 서버 모드에서 벡터 DB와 태그 캐시를 이중화하여 무중단 인덱싱을 지원한다.
@@ -421,6 +428,8 @@ context_search.exe                                            MCP 서버 모드 
 ```
 - `category_filter` 파라미터로 도메인 필터링 가능
 - `tags` 파라미터로 명시적 태그 추가 가능 (미지정 시 벡터 결과에서 자동 추출)
+- 검색 결과에 `related_classes` 포함 — ChromaDB metadata에 JSON 문자열로 저장
+- `combined_search` 최종 결과는 `n_results`(기본 5개)로 제한
 
 ### 의존성
 - `chromadb` — context_search.exe에만 번들 (`onnxruntime` + `tokenizers` 포함)
