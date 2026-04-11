@@ -100,10 +100,10 @@ def _call_claude(prompt: str) -> str | None:
 
 
 def _call_gemini(prompt: str) -> str | None:
-    """Gemini CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None."""
+    """Gemini CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None. (폴백은 _call_llm에서 처리)"""
     if not shutil.which("gemini"):
-        print("[경고] Gemini CLI를 찾을 수 없어 Claude로 대체합니다.")
-        return _call_claude(prompt)
+        log("[경고] Gemini CLI를 찾을 수 없음")
+        return None
     result = subprocess.run(
         ["gemini", "-y", prompt],
         capture_output=True, text=True, encoding='utf-8', errors='replace'
@@ -115,7 +115,16 @@ def _call_gemini(prompt: str) -> str | None:
 
 
 def _call_llm(prompt: str, use_gemini: bool = False) -> str | None:
-    """use_gemini 플래그에 따라 Gemini 또는 Claude를 호출한다."""
+    """use_gemini 플래그에 따라 Gemini 또는 Claude를 호출한다. 실패 시 다른 LLM으로 폴백."""
     if use_gemini:
+        result = _call_gemini(prompt)
+        if result is not None:
+            return result
+        log("[폴백] Gemini 실패 → Claude로 재시도")
+        return _call_claude(prompt)
+    else:
+        result = _call_claude(prompt)
+        if result is not None:
+            return result
+        log("[폴백] Claude 실패 → Gemini로 재시도")
         return _call_gemini(prompt)
-    return _call_claude(prompt)

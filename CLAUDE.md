@@ -204,12 +204,17 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 - 커맨드렛 출력을 Claude CLI로 분석 → `reviews/YYYY-MM-DD_HHMM_<커밋해시>_assets.md` 저장
 - `config.json`의 `auto_asset_validation: false` 로 비활성화 가능
 
-**Claude CLI 호출 방식**
+**LLM 호출 방식 (`_call_llm`)**
 ```
 claude -p --dangerously-skip-permissions --model <claude_model>
+gemini -y <prompt>
 ```
 → stdin으로 프롬프트 전달 (Windows 명령줄 길이 제한 회피)
 → `config.json`의 `claude_model`로 모델 지정 (기본값: `claude-sonnet-4-6`)
+→ **교차 폴백**: primary LLM 실패(토큰 소진 등) 시 자동으로 다른 LLM으로 재시도
+  - `use_gemini: false` → Claude 실패 시 Gemini 폴백
+  - `use_gemini: true` → Gemini 실패 시 Claude 폴백
+  - 양쪽 모두 실패 시 `None` 반환 → 해당 그룹 건너뜀
 
 **config.json 스키마:**
 ```json
