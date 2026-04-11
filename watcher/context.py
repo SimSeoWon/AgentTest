@@ -122,7 +122,7 @@ def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[s
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=120
+            encoding='utf-8', errors='replace', timeout=common.SUBPROCESS_TIMEOUT
         )
         if result.returncode == 0 and result.stdout.strip():
             import json as _json
@@ -148,7 +148,7 @@ def search_related_contexts(base_dir: Path, query: str, n_results: int = 3) -> l
     if common._server_mode and common._server_url:
         result = common._http_post("/api/v1/search/combined", {
             "query": query, "n_results": n_results,
-        }, timeout=30)
+        }, timeout=common.HTTP_TIMEOUT_SHORT)
         if result:
             return result.get("results", [])
         return []
@@ -162,7 +162,7 @@ def search_related_contexts(base_dir: Path, query: str, n_results: int = 3) -> l
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=30
+            encoding='utf-8', errors='replace', timeout=common.HTTP_TIMEOUT_SHORT
         )
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout.strip())
@@ -453,7 +453,8 @@ def process_commit(
                 if result.get("review"):
                     all_reviews.append(result["review"])
             except Exception as e:
-                common.log(f"[경고] 처리 실패 ({dk}): {e}")
+                import traceback
+                common.log(f"[경고] 처리 실패 ({dk}): {e}\n{traceback.format_exc()}")
                 fail += 1
 
     if fail:
@@ -545,7 +546,8 @@ def initial_context_build(
                 else:
                     fail += 1
             except Exception as e:
-                common.log(f"[경고] 초기화 실패 ({dk}): {e}")
+                import traceback
+                common.log(f"[경고] 초기화 실패 ({dk}): {e}\n{traceback.format_exc()}")
                 fail += 1
             if completed % 10 == 0 or completed == total_modules:
                 common.log(f"초기화 진행: {completed}/{total_modules} (성공: {success}, 실패: {fail})")

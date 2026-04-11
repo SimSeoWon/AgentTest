@@ -236,14 +236,17 @@ def promote_domains(
     domain_dir = context_dir / common.DOMAIN_DIR_NAME
     domain_dir.mkdir(parents=True, exist_ok=True)
 
-    # 이미 도메인으로 만들어진 클러스터인지 확인
+    # 이미 도메인으로 만들어진 클러스터인지 확인 (양방향 체크)
     new_clusters = []
     for cluster in clusters:
         cluster_set = set(cluster)
         already = False
         for domain_sources in existing.values():
-            # 소스 문서의 80% 이상이 겹치면 이미 존재하는 도메인
-            if len(cluster_set & domain_sources) >= len(cluster_set) * 0.8:
+            overlap = len(cluster_set & domain_sources)
+            # 클러스터의 80% 이상이 기존 도메인에 포함되거나,
+            # 기존 도메인의 80% 이상이 클러스터에 포함되면 중복
+            if (domain_sources and overlap >= len(domain_sources) * 0.8) or \
+               (cluster_set and overlap >= len(cluster_set) * 0.8):
                 already = True
                 break
         if not already:

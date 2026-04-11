@@ -40,8 +40,6 @@ def _setup_job_object():
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 플래그로
     watch.exe 종료 시 모든 자식/손자 프로세스(claude, MCP 서버)가 자동 정리된다.
     """
-    if sys.platform != 'win32':
-        return None
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -92,11 +90,9 @@ def _setup_job_object():
         return None
 
 
-# MCP 프로세스명 목록 (Job Object 실패 시 폴백용)
-_MCP_PROCESS_NAMES = [
-    "context_search.exe", "log_analyzer.exe", "crash_analyzer.exe",
-    "commandlet_runner.exe", "gemini_query.exe",
-]
+# MCP 프로세스명 목록 (Job Object 실패 시 폴백용) — agent_templates에서 자동 추출
+from agent_templates import MCP_SERVERS
+_MCP_PROCESS_NAMES = [Path(p).name for p in MCP_SERVERS.values()]
 
 
 def _kill_orphan_mcps():
@@ -112,8 +108,6 @@ def _kill_orphan_mcps():
             except Exception:
                 pass
         common._server_proc = None
-    if sys.platform != 'win32':
-        return
     for name in _MCP_PROCESS_NAMES:
         os.system(f'taskkill /F /IM {name} >nul 2>&1')
 
@@ -166,6 +160,27 @@ def find_git_repo(base_dir: Path) -> Path:
 # ─────────────────────────────────────────
 # 방화벽
 # ─────────────────────────────────────────
+# 포트 점유 정리
+# ─────────────────────────────────────────
+
+def _ensure_port_free(port: int):
+    """포트가 점유 중이면 해당 프로세스를 정리한다."""
+    result = subprocess.run(
+        ["netstat", "-ano"],
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+    )
+    for line in result.stdout.splitlines():
+        if f":{port}" in line and "LISTENING" in line:
+            parts = line.split()
+            pid = parts[-1]
+            if pid.isdigit() and int(pid) != os.getpid():
+                common.log(f"포트 {port} 점유 프로세스 정리 (PID {pid})")
+                os.system(f'taskkill /F /PID {pid} >nul 2>&1')
+
+
+# ─────────────────────────────────────────
+# 방화벽
+# ─────────────────────────────────────────
 
 def _firewall_rule_name(port: int) -> str:
     return f"AgentWatch Context Server (TCP {port})"
@@ -202,6 +217,21 @@ def _setup_firewall(port: int):
 # 설정
 # ─────────────────────────────────────────
 
+CONFIG_VERSION = 2  # config 스키마 버전
+
+_CONFIG_DEFAULTS = {
+    "auto_review": True,
+    "auto_asset_validation": True,
+    "use_gemini": False,
+    "claude_model": "claude-sonnet-4-6",
+    "server_mode": False,
+    "server_host": "0.0.0.0",
+    "server_port": 8100,
+    "context_server_url": "",
+    "enable_log": True,
+}
+
+
 def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     config_path = base_dir / common.CONFIG_FILE
 
@@ -219,6 +249,18 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
                     config["server_port"] = int(config["server_port"])
                 except (ValueError, TypeError):
                     config["server_port"] = 8100
+            # 스키마 마이그레이션: 누락 필드 보충
+            updated = False
+            for key, default in _CONFIG_DEFAULTS.items():
+                if key not in config:
+                    config[key] = default
+                    updated = True
+            if config.get("_version", 0) < CONFIG_VERSION:
+                config["_version"] = CONFIG_VERSION
+                updated = True
+            if updated:
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, ensure_ascii=False, indent=2)
             return config
 
     print("=" * 50)
@@ -269,12 +311,14 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
         port_raw = input("HTTP 서버 포트 (기본값: 8100): ").strip()
         server_port = int(port_raw) if port_raw.isdigit() else 8100
         # 방화벽 인바운드 규칙 설정
-        if sys.platform == 'win32':
-            fw_raw = input(f"방화벽 인바운드 포트 {server_port} 설정을 확인해보시겠습니까? (y/n): ").strip().lower()
-            if fw_raw == 'y':
-                _setup_firewall(server_port)
+        fw_raw = input(f"방화벽 인바운드 포트 {server_port} 설정을 확인해보시겠습니까? (y/n): ").strip().lower()
+        if fw_raw == 'y':
+            _setup_firewall(server_port)
     else:
         url_raw = input("원격 RAG 서버 URL (없으면 Enter, 예: http://192.168.1.100:8100): ").strip()
+        if url_raw and not url_raw.startswith("http://") and not url_raw.startswith("https://"):
+            url_raw = "http://" + url_raw
+            print(f"  → 프로토콜 자동 추가: {url_raw}")
         context_server_url = url_raw
 
     enable_log_raw = input("파일 로그 활성화 (기본값: y) [y/n]: ").strip().lower()
@@ -382,8 +426,7 @@ def main():
     # 프로세스 정리 설정: Job Object (1차) + atexit/signal (폴백)
     _job = _setup_job_object()
     atexit.register(_kill_orphan_mcps)
-    if sys.platform == 'win32':
-        signal.signal(signal.SIGBREAK, _on_exit_signal)
+    signal.signal(signal.SIGBREAK, _on_exit_signal)
 
     base_dir = get_base_dir()
 
@@ -419,11 +462,13 @@ def main():
     server_host = config.get("server_host", "0.0.0.0")
 
     if common._server_mode:
-        # 방화벽 규칙 확인 (Windows)
-        if sys.platform == 'win32' and not _check_firewall_exists(server_port):
+        # 방화벽 규칙 확인
+        if not _check_firewall_exists(server_port):
             fw_raw = input(f"방화벽 인바운드 포트 {server_port} 설정을 확인해보시겠습니까? (y/n): ").strip().lower()
             if fw_raw == 'y':
                 _setup_firewall(server_port)
+        # 이전 실행 잔여 프로세스 포트 정리
+        _ensure_port_free(server_port)
         common._server_url = f"http://localhost:{server_port}"
         # context_search HTTP 서버를 백그라운드 프로세스로 시작
         cmd = _get_context_search_cmd(base_dir)

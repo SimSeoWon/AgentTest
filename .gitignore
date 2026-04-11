@@ -8,3 +8,6 @@ AgentWatch.zip
 __pycache__/
 *.pyc
 *.pyo
+
+# Claude Code 로컬 설정 (PC별 권한, 절대 경로 포함)
+.claude/settings.local.json

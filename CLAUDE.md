@@ -481,7 +481,8 @@ context_search.exe                                            MCP 서버 모드 
 
 ## 개발 환경 및 규칙
 
-- 플랫폼: Windows 11, 기본 셸은 `bash` (Git Bash / WSL)
+- **플랫폼: Windows 전용** — macOS/Linux 지원 불필요. 크로스 플랫폼 분기나 호환성 코드를 추가하지 말 것.
+- 기본 셸은 `bash` (Git Bash)
 - 에이전트 추가 시: `agent_templates.py`의 `AGENTS`, `ROLE_TEMPLATES`, `PROMPT_TEMPLATES`, `SETTINGS_TEMPLATES`, `SKILL_INDEX`에 동시 추가
 - MCP 추가 시: `mcp/<name>/server.py` 생성 → `build.bat`에 빌드 라인 추가 → 관련 에이전트 `SETTINGS_TEMPLATES`에 등록
 - 컨텍스트 도메인 추가 시: `agent_templates.py`의 `DEFAULT_CONTEXT_DOMAINS` 리스트에 추가

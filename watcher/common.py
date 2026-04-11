@@ -20,6 +20,11 @@ ASSET_EXTENSIONS = {'.uasset', '.umap'}
 MAX_WORKERS = 6  # 병렬 LLM 호출 수
 DOMAIN_DIR_NAME = "_domains"
 
+# 타임아웃 상수
+HTTP_TIMEOUT_SHORT = 30       # 상태 확인, 검색
+HTTP_TIMEOUT_INDEXING = 120   # 인덱싱, 리빌드
+SUBPROCESS_TIMEOUT = 120      # CLI 호출
+
 # ─────────────────────────────────────────
 # 모듈 레벨 변수 (main()에서 변경, 다른 모듈에서 common.xxx로 접근)
 # ─────────────────────────────────────────
@@ -74,13 +79,16 @@ def _cleanup_old_logs():
     if not _log_dir or not _log_dir.exists():
         return
     from datetime import timedelta
+    import re as _re
     cutoff = datetime.now() - timedelta(days=LOG_RETENTION_DAYS)
-    for log_file in _log_dir.glob("watch_*.log"):
+    for log_file in _log_dir.glob("*.log"):
         try:
-            date_str = log_file.stem.replace("watch_", "")
-            file_date = datetime.strptime(date_str, '%Y-%m-%d')
-            if file_date < cutoff:
-                log_file.unlink()
+            # 파일명에서 YYYY-MM-DD 패턴 추출
+            m = _re.search(r'(\d{4}-\d{2}-\d{2})', log_file.stem)
+            if m:
+                file_date = datetime.strptime(m.group(1), '%Y-%m-%d')
+                if file_date < cutoff:
+                    log_file.unlink()
         except (ValueError, OSError):
             pass
 
@@ -98,7 +106,7 @@ def log(msg: str):
 # HTTP 유틸 (서버 모드)
 # ─────────────────────────────────────────
 
-def _http_post(endpoint: str, payload: dict, timeout: int = 120) -> dict | None:
+def _http_post(endpoint: str, payload: dict, timeout: int = HTTP_TIMEOUT_INDEXING) -> dict | None:
     """HTTP POST 요청. 서버 모드에서 인덱싱/검색에 사용."""
     import urllib.request
     import urllib.error
@@ -116,7 +124,7 @@ def _http_post(endpoint: str, payload: dict, timeout: int = 120) -> dict | None:
         return None
 
 
-def _http_get(endpoint: str, timeout: int = 30) -> dict | None:
+def _http_get(endpoint: str, timeout: int = HTTP_TIMEOUT_SHORT) -> dict | None:
     """HTTP GET 요청. 서버 모드에서 상태 확인에 사용."""
     import urllib.request
     import urllib.error
@@ -148,7 +156,7 @@ def _call_claude(prompt: str) -> str | None:
         capture_output=True, text=True, encoding='utf-8',
     )
     if result.returncode != 0:
-        print(f"[오류] Claude 호출 실패: {result.stderr[:200]}")
+        log(f"[오류] Claude 호출 실패: {result.stderr[:200]}")
         return None
     return result.stdout
 
@@ -168,22 +176,29 @@ def _call_gemini(prompt: str) -> str | None:
         log(f"[오류] Gemini 실행 실패: {e}")
         return None
     if result.returncode != 0:
-        print(f"[오류] Gemini 호출 실패: {result.stderr[:200]}")
+        log(f"[오류] Gemini 호출 실패: {result.stderr[:200]}")
         return None
     return result.stdout
 
 
+_fallback_count = 0  # 폴백 발생 횟수 (비용 추적용)
+
 def _call_llm(prompt: str, use_gemini: bool = False) -> str | None:
-    """use_gemini 플래그에 따라 Gemini 또는 Claude를 호출한다. 실패 시 다른 LLM으로 폴백."""
+    """use_gemini 플래그에 따라 Gemini 또는 Claude를 호출한다. 실패 시 대기 후 다른 LLM으로 폴백."""
+    global _fallback_count
     if use_gemini:
         result = _call_gemini(prompt)
         if result is not None:
             return result
-        log("[폴백] Gemini 실패 → Claude로 재시도")
+        _fallback_count += 1
+        log(f"[폴백] Gemini 실패 → 10초 대기 후 Claude로 재시도 (누적 폴백: {_fallback_count}회)")
+        import time; time.sleep(10)
         return _call_claude(prompt)
     else:
         result = _call_claude(prompt)
         if result is not None:
             return result
-        log("[폴백] Claude 실패 → Gemini로 재시도")
+        _fallback_count += 1
+        log(f"[폴백] Claude 실패 → 10초 대기 후 Gemini로 재시도 (누적 폴백: {_fallback_count}회)")
+        import time; time.sleep(10)
         return _call_gemini(prompt)
