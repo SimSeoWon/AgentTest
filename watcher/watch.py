@@ -400,9 +400,31 @@ def git_pull(repo_dir: Path, branch: str) -> bool:
 def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]:
     result = subprocess.run(
         ["git", "diff", "--name-only", old_hash, new_hash],
-        cwd=repo_dir, capture_output=True, text=True
+        cwd=repo_dir, capture_output=True, text=True,
+        encoding='utf-8', errors='replace',
     )
     return [f for f in result.stdout.strip().split('\n') if f]
+
+
+def get_commits_between(repo_dir: Path, old_hash: str, new_hash: str) -> list[dict]:
+    """두 해시 사이의 커밋 목록을 반환한다. [{hash, author, message}, ...]"""
+    result = subprocess.run(
+        ["git", "log", "--format=%H|%an|%s", f"{old_hash}..{new_hash}"],
+        cwd=repo_dir, capture_output=True, text=True,
+        encoding='utf-8', errors='replace',
+    )
+    commits = []
+    for line in result.stdout.strip().split('\n'):
+        if '|' not in line:
+            continue
+        parts = line.split('|', 2)
+        commits.append({
+            "hash": parts[0],
+            "author": parts[1] if len(parts) > 1 else "unknown",
+            "message": parts[2] if len(parts) > 2 else "",
+        })
+    commits.reverse()  # 오래된 순서로
+    return commits
 
 
 # ─────────────────────────────────────────
@@ -533,7 +555,7 @@ def main():
             common.log("벡터 인덱스 초기 구축 중...")
             update_vector_index(context_dir, base_dir)
 
-    common.log("감시 시작... (종료: Ctrl+C)")
+    common.log(f"AgentWatch v{common.VERSION} 감시 시작... (종료: Ctrl+C)")
 
     poll_count = 0
     while True:
@@ -569,22 +591,28 @@ def main():
                             if not git_pull(repo_dir, branch):
                                 common.log(f"  다음 폴링에서 재시도합니다. ({poll_interval}초 후)")
                             else:
-                                # pull 후 실제 최신 해시 재확인 (작업 중 추가 커밋 대응)
                                 actual_hash = get_local_hash(repo_dir)
-                                if actual_hash != remote_hash:
-                                    common.log(f"추가 커밋 포함: {remote_hash[:8]} → {actual_hash[:8]}")
+                                commits = get_commits_between(repo_dir, last_hash, actual_hash)
+                                common.log(f"새 커밋 {len(commits)}개 처리 시작")
 
-                                changed_files = get_changed_files(repo_dir, last_hash, actual_hash)
-                                common.log(f"변경된 파일 {len(changed_files)}개")
+                                for ci, commit in enumerate(commits, 1):
+                                    c_hash = commit["hash"]
+                                    c_author = commit["author"]
+                                    c_msg = commit["message"]
+                                    # 이전 커밋과의 diff
+                                    prev = commits[ci - 2]["hash"] if ci > 1 else last_hash
+                                    changed_files = get_changed_files(repo_dir, prev, c_hash)
+                                    common.log(f"[{ci}/{len(commits)}] {c_hash[:8]} ({c_author}) — {len(changed_files)}개 파일")
 
-                                process_commit(
-                                    repo_dir, context_dir, reviews_dir,
-                                    changed_files, actual_hash,
-                                    auto_review=auto_review, use_gemini=use_gemini,
-                                )
+                                    process_commit(
+                                        repo_dir, context_dir, reviews_dir,
+                                        changed_files, c_hash,
+                                        auto_review=auto_review, use_gemini=use_gemini,
+                                        author=c_author,
+                                    )
 
-                                if auto_asset_validation:
-                                    run_asset_validation(base_dir, reviews_dir, changed_files, actual_hash, use_gemini=use_gemini)
+                                    if auto_asset_validation:
+                                        run_asset_validation(base_dir, reviews_dir, changed_files, c_hash, use_gemini=use_gemini)
 
                                 last_hash = actual_hash
                                 save_state(base_dir, last_hash)

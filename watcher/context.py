@@ -415,6 +415,7 @@ def process_commit(
     repo_dir: Path, context_dir: Path, reviews_dir: Path,
     changed_files: list[str], commit_hash: str,
     auto_review: bool = True, use_gemini: bool = False,
+    author: str = "",
 ):
     """
     컨텍스트 생성 + 코드 리뷰를 디렉토리(모듈) 단위로 한 번에 처리한다.
@@ -467,14 +468,17 @@ def process_commit(
 
     # 리뷰 리포트 저장
     if all_reviews:
-        report = _build_review_report(all_reviews, commit_hash)
+        report = _build_review_report(all_reviews, commit_hash, author)
         timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-        report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}.md"
+        # 파일명에 작성자 포함 (파일명 안전 문자로 변환)
+        import re as _re
+        safe_author = _re.sub(r'[\\/:*?"<>|\s]', '_', author) if author else "unknown"
+        report_path = reviews_dir / f"{timestamp}_{safe_author}_{commit_hash[:8]}.md"
         report_path.write_text(report, encoding='utf-8')
         common.log(f"코드 리뷰 완료 → {report_path.relative_to(reviews_dir.parent.parent)}")
 
 
-def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
+def _build_review_report(file_reviews: list[dict], commit_hash: str, author: str = "") -> str:
     """모듈별 리뷰 결과를 직접 취합하여 통합 리포트를 생성한다. (LLM 호출 없음)"""
     file_reviews.sort(key=lambda r: r["file"])
 
@@ -483,9 +487,11 @@ def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
         for r in file_reviews
     )
 
+    author_line = f"작성자: {author}  \n" if author else ""
     return (
         f"# 코드 리뷰 리포트\n\n"
         f"커밋: `{commit_hash}`  \n"
+        f"{author_line}"
         f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n"
         f"검토 모듈: {len(file_reviews)}개\n\n"
         f"---\n\n"

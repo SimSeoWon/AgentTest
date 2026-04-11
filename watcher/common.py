@@ -13,6 +13,7 @@ from datetime import datetime
 # 상수
 # ─────────────────────────────────────────
 
+VERSION = "1.1.3"
 CONFIG_FILE = "config.json"
 STATE_FILE = ".watch_state"
 TARGET_EXTENSIONS = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}

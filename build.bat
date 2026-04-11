@@ -1,5 +1,9 @@
 @echo off
 chcp 65001 >nul
+setlocal enabledelayedexpansion
+
+REM Patch version auto-increment
+for /f "delims=" %%v in ('powershell -ExecutionPolicy Bypass -File bump_version.ps1') do echo  Version: %%v
 
 echo ===================================
 echo  AgentTest - Full Build
