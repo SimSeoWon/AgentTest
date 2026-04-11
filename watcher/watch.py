@@ -1,4 +1,7 @@
-import re
+"""
+메인 워처 스크립트. Git 감시 루프와 프로세스 관리만 담당한다.
+실제 로직은 common, setup, context, domain, review 모듈로 분리됨.
+"""
 import os
 import sys
 import json
@@ -9,58 +12,22 @@ import shutil
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-from agent_templates import (
-    AGENTS, ROLE_TEMPLATES, PROMPT_TEMPLATES,
-    SKILL_INDEX, DEFAULT_CONTEXT_DOMAINS, SETTINGS_TEMPLATES,
-    MCP_SERVERS, PROJECT_CLAUDE_MD_SECTION,
-    AGENTWATCH_MD_MARKER_START, AGENTWATCH_MD_MARKER_END,
+import common
+from setup import init_project_dirs
+from context import (
+    initial_context_build, update_vector_index,
+    process_commit, _get_context_search_cmd,
 )
+from domain import (
+    promote_domains, generate_health_report,
+    DOMAIN_CHECK_INTERVAL, HEALTH_CHECK_INTERVAL,
+)
+from review import run_asset_validation
 
-CONFIG_FILE = "config.json"
-STATE_FILE = ".watch_state"
-TARGET_EXTENSIONS = {'.cpp', '.h', '.hpp', '.inl', '.cs', '.py'}
-ASSET_EXTENSIONS = {'.uasset', '.umap'}
-MAX_WORKERS = 6  # 병렬 LLM 호출 수
+
 _processing_lock = threading.Lock()  # 중복 실행 방지
-
-# 서버 모드 상태
-_server_mode = False
-_server_url = ""   # 예: "http://localhost:8100"
-_server_proc = None  # context_search --serve 프로세스
-
-
-def _http_post(endpoint: str, payload: dict, timeout: int = 120) -> dict | None:
-    """HTTP POST 요청. 서버 모드에서 인덱싱/검색에 사용."""
-    import urllib.request
-    import urllib.error
-    url = f"{_server_url.rstrip('/')}{endpoint}"
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data,
-        headers={"Content-Type": "application/json; charset=utf-8"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        log(f"[경고] HTTP 요청 실패 ({endpoint}): {e}")
-        return None
-
-
-def _http_get(endpoint: str, timeout: int = 30) -> dict | None:
-    """HTTP GET 요청. 서버 모드에서 상태 확인에 사용."""
-    import urllib.request
-    import urllib.error
-    url = f"{_server_url.rstrip('/')}{endpoint}"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        log(f"[경고] HTTP 요청 실패 ({endpoint}): {e}")
-        return None
 
 
 # ─────────────────────────────────────────
@@ -135,17 +102,16 @@ _MCP_PROCESS_NAMES = [
 def _kill_orphan_mcps():
     """알려진 MCP 프로세스를 강제 종료한다 (Job Object 실패 시 폴백)."""
     # 서버 프로세스 정리
-    global _server_proc
-    if _server_proc is not None:
+    if common._server_proc is not None:
         try:
-            _server_proc.terminate()
-            _server_proc.wait(timeout=5)
+            common._server_proc.terminate()
+            common._server_proc.wait(timeout=5)
         except Exception:
             try:
-                _server_proc.kill()
+                common._server_proc.kill()
             except Exception:
                 pass
-        _server_proc = None
+        common._server_proc = None
     if sys.platform != 'win32':
         return
     for name in _MCP_PROCESS_NAMES:
@@ -157,6 +123,10 @@ def _on_exit_signal(signum, frame):
     _kill_orphan_mcps()
     sys.exit(0)
 
+
+# ─────────────────────────────────────────
+# 기본 경로
+# ─────────────────────────────────────────
 
 def get_base_dir() -> Path:
     """exe 실행 시 exe 위치, py 직접 실행 시 프로젝트 루트 반환"""
@@ -193,8 +163,12 @@ def find_git_repo(base_dir: Path) -> Path:
     )
 
 
+# ─────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────
+
 def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
-    config_path = base_dir / CONFIG_FILE
+    config_path = base_dir / common.CONFIG_FILE
 
     if config_path.exists():
         with open(config_path, encoding='utf-8') as f:
@@ -274,323 +248,6 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     return config
 
 
-def init_project_dirs(base_dir: Path) -> tuple[Path, Path, Path]:
-    """
-    .claude/ 및 하위 디렉토리 초기화 (머지 방식).
-    반환: (context_dir, agents_dir, reviews_dir)
-    """
-    claude_dir = base_dir / ".claude"
-    is_new = not claude_dir.exists()
-    claude_dir.mkdir(exist_ok=True)
-
-    # context/ — 항상 실행: 새 도메인 폴더가 추가돼도 반영
-    context_dir = claude_dir / "context"
-    context_dir.mkdir(exist_ok=True)
-    for domain in DEFAULT_CONTEXT_DOMAINS:
-        (context_dir / domain).mkdir(exist_ok=True)
-
-    # reviews/ — 코드 리뷰 리포트 저장
-    reviews_dir = claude_dir / "reviews"
-    reviews_dir.mkdir(exist_ok=True)
-
-    # agents/ — 항상 실행: 새 에이전트가 추가돼도 반영
-    agents_dir = claude_dir / "agents"
-    agents_dir.mkdir(exist_ok=True)
-    added = _merge_agents(agents_dir)
-
-    # MCP 서버 및 CLAUDE.md — 항상 머지 (기존 Claude 환경 대응)
-    _update_project_settings(claude_dir)
-    _update_project_claude_md(base_dir)
-
-    if is_new:
-        log(".claude/ 구조 초기화 완료")
-    elif added:
-        log(f".claude/ 머지 완료 — 새 에이전트 {len(added)}개 추가: {', '.join(added)}")
-
-    return context_dir, agents_dir, reviews_dir
-
-
-def _merge_agents(agents_dir: Path) -> list[str]:
-    """
-    agents/ 하위를 현재 AGENTS 목록과 머지한다.
-    - 없는 에이전트 폴더/파일 → 새로 생성
-    - 이미 있는 role.md / prompt.md / settings.json → 보존 (커스텀 보호)
-    - SKILL_INDEX.md → 항상 최신으로 덮어쓰기
-    반환: 새로 추가된 에이전트 이름 목록
-    """
-    added = []
-
-    for agent_name in AGENTS:
-        agent_dir = agents_dir / agent_name
-        is_new_agent = not agent_dir.exists()
-        agent_dir.mkdir(exist_ok=True)
-
-        if not (agent_dir / "role.md").exists():
-            (agent_dir / "role.md").write_text(
-                ROLE_TEMPLATES.get(agent_name, f"# {agent_name}\n\n역할을 정의하세요.\n"),
-                encoding='utf-8'
-            )
-
-        if not (agent_dir / "prompt.md").exists():
-            (agent_dir / "prompt.md").write_text(
-                PROMPT_TEMPLATES.get(agent_name, "# 프롬프트 템플릿\n\n프롬프트를 작성하세요.\n"),
-                encoding='utf-8'
-            )
-
-        if not (agent_dir / "settings.json").exists():
-            (agent_dir / "settings.json").write_text(
-                json.dumps(SETTINGS_TEMPLATES.get(agent_name, {}), ensure_ascii=False, indent=2),
-                encoding='utf-8'
-            )
-
-        if is_new_agent:
-            added.append(agent_name)
-
-    # SKILL_INDEX.md — 항상 최신 상태로 갱신
-    (agents_dir / "SKILL_INDEX.md").write_text(SKILL_INDEX, encoding='utf-8')
-
-    return added
-
-
-DOMAIN_HINT_SCRIPT = '''\
-"""PostToolUse hook: 편집된 파일이 속한 도메인 정보를 Claude에게 전달한다."""
-import sys, json, subprocess
-from pathlib import Path
-
-def main():
-    data = json.load(sys.stdin)
-    file_path = data.get("tool_input", {}).get("file_path", "")
-    if not file_path:
-        return
-
-    cwd = data.get("cwd", ".")
-    exe = Path(cwd) / ".claude" / "mcp" / "context_search.exe"
-    if not exe.exists():
-        return
-
-    query = Path(file_path).stem
-    try:
-        result = subprocess.run(
-            [str(exe), "--search", cwd, query, "3"],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=10,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return
-
-        info = json.loads(result.stdout.strip())
-        results = info.get("results", [])
-        domains = [r for r in results if "_domains/" in r.get("file", "")]
-        if domains:
-            d = domains[0]
-            hint = f"[도메인] {d.get('file', '')}\\n{d.get('content_preview', '')[:300]}"
-            print(hint, file=sys.stderr)
-    except Exception:
-        pass
-
-if __name__ == "__main__":
-    main()
-'''
-
-
-def _deploy_hook_scripts(claude_dir: Path):
-    """hook 스크립트를 .claude/hooks/에 배포한다."""
-    hooks_dir = claude_dir / "hooks"
-    hooks_dir.mkdir(exist_ok=True)
-    script_path = hooks_dir / "domain_hint.py"
-    # 항상 최신으로 갱신
-    script_path.write_text(DOMAIN_HINT_SCRIPT, encoding='utf-8')
-
-
-def _update_project_settings(claude_dir: Path):
-    """
-    MCP 서버를 두 곳에 머지한다:
-      1. 프로젝트 루트 .mcp.json — Claude Code가 실제로 읽는 파일
-      2. .claude/settings.json — 에이전트 레벨 참조용 (하위 호환)
-    - 이미 등록된 서버는 보존 (사용자 커스텀 유지)
-    - 누락된 서버만 추가
-    - 항상 실행 (기존 파일 여부 무관)
-    """
-    base_dir = claude_dir.parent
-
-    # 1. .mcp.json (프로젝트 루트) — Claude Code가 읽는 MCP 설정
-    mcp_json_path = base_dir / ".mcp.json"
-    mcp_json: dict = {}
-    if mcp_json_path.exists():
-        try:
-            mcp_json = json.loads(mcp_json_path.read_text(encoding='utf-8'))
-        except Exception:
-            mcp_json = {}
-
-    mcp_servers = mcp_json.setdefault("mcpServers", {})
-    added_mcp = []
-    for name, exe in MCP_SERVERS.items():
-        if name not in mcp_servers:
-            mcp_servers[name] = {"command": exe, "args": []}
-            added_mcp.append(name)
-
-    mcp_json_path.write_text(
-        json.dumps(mcp_json, ensure_ascii=False, indent=2),
-        encoding='utf-8'
-    )
-
-    if added_mcp:
-        log(f".mcp.json MCP 등록 추가: {', '.join(added_mcp)}")
-
-    # 2. .claude/settings.json — 하위 호환 및 에이전트 참조용
-    settings_path = claude_dir / "settings.json"
-    settings: dict = {}
-    if settings_path.exists():
-        try:
-            settings = json.loads(settings_path.read_text(encoding='utf-8'))
-        except Exception:
-            settings = {}
-
-    mcp = settings.setdefault("mcpServers", {})
-    added = []
-    for name, exe in MCP_SERVERS.items():
-        if name not in mcp:
-            mcp[name] = {"command": exe, "args": []}
-            added.append(name)
-
-    # hooks 머지 (누락된 이벤트만 추가, 기존 보존)
-    hooks = settings.setdefault("hooks", {})
-    hooks_added = False
-    if "PostToolUse" not in hooks:
-        hooks["PostToolUse"] = [
-            {
-                "matcher": "Edit|Write",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": sys.executable + " " + str(claude_dir / "hooks" / "domain_hint.py"),
-                        "timeout": 10,
-                    }
-                ]
-            }
-        ]
-        hooks_added = True
-
-    settings_path.write_text(
-        json.dumps(settings, ensure_ascii=False, indent=2),
-        encoding='utf-8'
-    )
-
-    if added:
-        log(f"settings.json MCP 등록 추가: {', '.join(added)}")
-    if hooks_added:
-        log("settings.json hooks 등록 추가: PostToolUse (도메인 힌트)")
-
-    # hook 스크립트 배포
-    _deploy_hook_scripts(claude_dir)
-
-
-def _build_domain_map_section(context_dir: Path) -> str:
-    """
-    context/_domains/ 의 도메인 문서를 스캔하여 도메인 맵 섹션을 동적 생성한다.
-    도메인이 없으면 빈 문자열을 반환한다.
-    """
-    domain_dir = context_dir / DOMAIN_DIR_NAME
-    if not domain_dir.exists():
-        return ""
-
-    entries = []
-    for md_file in sorted(domain_dir.glob("*.md")):
-        if md_file.name.startswith("_"):
-            continue
-        try:
-            content = md_file.read_text(encoding='utf-8')
-        except Exception:
-            continue
-
-        # 프론트매터 파싱
-        fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
-        if not fm_match:
-            continue
-        fm = fm_match.group(1)
-
-        tags_m = re.search(r'tags:\s*\[([^\]]*)\]', fm)
-        tags = tags_m.group(1).strip() if tags_m else ""
-        cat_m = re.search(r'category:\s*(.+)', fm)
-        category = cat_m.group(1).strip() if cat_m else ""
-        sources = re.findall(r'-\s+(\S+\.md)', fm)
-
-        # 시스템 개요 첫 문장 추출
-        overview_m = re.search(r'## 시스템 개요\s*\n(.+)', content)
-        summary = overview_m.group(1).strip()[:80] if overview_m else ""
-
-        entries.append(f"| {md_file.stem} | {summary} | {tags} | {len(sources)}개 |")
-
-    if not entries:
-        return ""
-
-    section = (
-        "\n### 도메인 맵 (자동 생성)\n\n"
-        "| 도메인 | 개요 | 태그 | 소스 |\n"
-        "|--------|------|------|------|\n"
-        + "\n".join(entries)
-        + "\n\n"
-        "**기능 추가/변경 요청 시 워크플로우:**\n"
-        "1. `combined_search`로 관련 도메인 문서를 먼저 검색\n"
-        "2. 도메인의 '설계 패턴 및 확장 포인트'를 확인\n"
-        "3. `source_documents` 목록의 실제 코드를 읽고 작업 시작\n"
-    )
-    return section
-
-
-def _merge_claude_md_section(md_path: Path, dynamic_section: str = ""):
-    """
-    지정한 CLAUDE.md 파일에 AgentWatch 관리 구역을 삽입/갱신한다.
-    - 마커 구역 있으면 최신 내용으로 교체
-    - 없으면 파일 끝에 추가
-    - 파일 자체가 없으면 새로 생성
-    dynamic_section: 도메인 맵 등 런타임에 생성되는 추가 섹션
-    """
-    full_section = PROJECT_CLAUDE_MD_SECTION.replace(
-        AGENTWATCH_MD_MARKER_END,
-        dynamic_section + AGENTWATCH_MD_MARKER_END,
-    )
-    if md_path.exists():
-        content = md_path.read_text(encoding='utf-8')
-        if AGENTWATCH_MD_MARKER_START in content:
-            content = re.sub(
-                re.escape(AGENTWATCH_MD_MARKER_START)
-                + r".*?"
-                + re.escape(AGENTWATCH_MD_MARKER_END),
-                full_section,
-                content,
-                flags=re.DOTALL,
-            )
-            return content, "갱신"
-        else:
-            content = content.rstrip() + "\n\n" + full_section + "\n"
-            return content, "추가"
-    else:
-        return full_section + "\n", "생성"
-
-
-def _update_project_claude_md(base_dir: Path):
-    """
-    CLAUDE.md에 AgentWatch 관리 구역을 삽입/갱신한다.
-    도메인 문서가 존재하면 도메인 맵 섹션도 동적으로 포함한다.
-    """
-    context_dir = base_dir / ".claude" / "context"
-    domain_section = _build_domain_map_section(context_dir)
-
-    # 1. 루트 CLAUDE.md
-    root_md = base_dir / "CLAUDE.md"
-    content, action = _merge_claude_md_section(root_md, domain_section)
-    root_md.write_text(content, encoding='utf-8')
-    log(f"CLAUDE.md AgentWatch 구역 {action}")
-
-    # 2. .claude/CLAUDE.md (있을 때만)
-    dot_claude_md = base_dir / ".claude" / "CLAUDE.md"
-    if dot_claude_md.exists():
-        content, action = _merge_claude_md_section(dot_claude_md, domain_section)
-        dot_claude_md.write_text(content, encoding='utf-8')
-        log(f".claude/CLAUDE.md AgentWatch 구역 {action}")
-
-
 # ─────────────────────────────────────────
 # Git 유틸
 # ─────────────────────────────────────────
@@ -637,1133 +294,17 @@ def get_changed_files(repo_dir: Path, old_hash: str, new_hash: str) -> list[str]
     return [f for f in result.stdout.strip().split('\n') if f]
 
 
-def _list_all_source_files(repo_dir: Path) -> list[str]:
-    """Git으로 추적 중인 모든 소스 파일 목록을 반환한다."""
-    result = subprocess.run(
-        ["git", "ls-files"],
-        cwd=repo_dir, capture_output=True, text=True,
-        encoding='utf-8', errors='replace'
-    )
-    if result.returncode != 0:
-        return []
-    return [f for f in result.stdout.strip().split('\n')
-            if f and Path(f).suffix in TARGET_EXTENSIONS]
-
-
-# ─────────────────────────────────────────
-# 벡터 인덱싱 (context_search.exe에 위임)
-# ─────────────────────────────────────────
-
-def _get_context_search_cmd(base_dir: Path) -> list[str]:
-    """context_search 실행 명령어를 반환한다. exe 없으면 Python 직접 실행."""
-    exe = base_dir / ".claude" / "mcp" / "context_search.exe"
-    if exe.exists():
-        return [str(exe)]
-    # 개발 모드: Python 스크립트 직접 실행
-    script = Path(__file__).parent.parent / "mcp" / "context_search" / "server.py"
-    if script.exists():
-        return [sys.executable, str(script)]
-    return []
-
-
-def update_vector_index(context_dir: Path, base_dir: Path, changed_files: list[str] | None = None):
-    """
-    벡터 인덱싱을 수행한다.
-    서버 모드: HTTP API로 요청, 로컬 모드: context_search.exe CLI 호출.
-    changed_files 지정 시 해당 파일의 MD만 upsert, 미지정 시 전체 rebuild.
-    """
-    # ── 서버 모드: HTTP API 사용 ──
-    if _server_mode and _server_url:
-        if changed_files:
-            md_set: set[str] = set()
-            for f in changed_files:
-                if Path(f).suffix not in TARGET_EXTENSIONS:
-                    continue
-                # 디렉토리 단위 MD (소규모 그룹)
-                dir_md = context_dir / (str(Path(f).parent) + ".md")
-                if dir_md.exists():
-                    md_set.add(str(dir_md.relative_to(context_dir)).replace("\\", "/"))
-                # stem 단위 MD (대규모 그룹에서 분할된 경우)
-                stem_md = context_dir / Path(f).with_suffix('.md')
-                if stem_md.exists():
-                    md_set.add(str(stem_md.relative_to(context_dir)).replace("\\", "/"))
-            md_paths = sorted(md_set)
-            if not md_paths:
-                return
-            result = _http_post("/api/v1/index/upsert", {"files": md_paths})
-        else:
-            result = _http_post("/api/v1/index/rebuild", {})
-
-        if result:
-            count = result.get("indexed_files") or result.get("upserted_files") or 0
-            if count:
-                log(f"벡터 인덱스 갱신: {count}개 문서")
-            if result.get("error"):
-                log(f"[경고] 벡터 인덱싱 오류: {result['error']}")
-        return
-
-    # ── 로컬 모드: subprocess CLI 호출 ──
-    cmd_base = _get_context_search_cmd(base_dir)
-    if not cmd_base:
-        log("[경고] context_search를 찾을 수 없어 벡터 인덱싱 건너뜀")
-        return
-
-    if changed_files:
-        md_set: set[str] = set()
-        for f in changed_files:
-            if Path(f).suffix not in TARGET_EXTENSIONS:
-                continue
-            # 디렉토리 단위 MD (소규모 그룹)
-            dir_md = context_dir / (str(Path(f).parent) + ".md")
-            if dir_md.exists():
-                md_set.add(str(dir_md.relative_to(context_dir)).replace("\\", "/"))
-            # stem 단위 MD (대규모 그룹에서 분할된 경우)
-            stem_md = context_dir / Path(f).with_suffix('.md')
-            if stem_md.exists():
-                md_set.add(str(stem_md.relative_to(context_dir)).replace("\\", "/"))
-        md_paths = sorted(md_set)
-        if not md_paths:
-            return
-        cmd = cmd_base + ["--upsert", str(base_dir)] + md_paths
-    else:
-        cmd = cmd_base + ["--rebuild", str(base_dir)]
-
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=120
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            import json as _json
-            info = _json.loads(result.stdout.strip())
-            count = info.get("indexed_files") or info.get("upserted_files") or 0
-            if count:
-                log(f"벡터 인덱스 갱신: {count}개 문서")
-        elif result.returncode != 0:
-            log(f"[경고] 벡터 인덱싱 실패: {result.stderr[:200]}")
-    except subprocess.TimeoutExpired:
-        log("[경고] 벡터 인덱싱 타임아웃 (120초)")
-    except Exception as e:
-        log(f"[경고] 벡터 인덱싱 오류: {e}")
-
-
-def search_related_contexts(base_dir: Path, query: str, n_results: int = 3) -> list[dict]:
-    """
-    관련 컨텍스트를 검색한다.
-    서버 모드: HTTP API, 로컬 모드: context_search.exe --search.
-    반환: [{"file": ..., "content_preview": ..., "tags": [...], ...}, ...]
-    """
-    # ── 서버 모드: HTTP API 사용 ──
-    if _server_mode and _server_url:
-        result = _http_post("/api/v1/search/combined", {
-            "query": query, "n_results": n_results,
-        }, timeout=30)
-        if result:
-            return result.get("results", [])
-        return []
-
-    # ── 로컬 모드: subprocess CLI 호출 ──
-    cmd_base = _get_context_search_cmd(base_dir)
-    if not cmd_base:
-        return []
-
-    cmd = cmd_base + ["--search", str(base_dir), query, str(n_results)]
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=30
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout.strip())
-            return data.get("results", [])
-    except Exception:
-        pass
-    return []
-
-
-# ─────────────────────────────────────────
-# 컨텍스트 갱신
-# ─────────────────────────────────────────
-
-def _extract_comments_section(md_content: str) -> str:
-    """MD 파일에서 ## 코멘트 섹션을 추출한다. 없으면 빈 문자열 반환."""
-    match = re.search(r'(## 코멘트\s*\n.*)', md_content, re.DOTALL)
-    return match.group(1).rstrip() if match else ""
-
-
-HEADER_EXTENSIONS = {'.h', '.hpp', '.inl'}
-
-# 디렉토리당 최대 프롬프트 크기 (클래스 여러 개를 한번에 분석하므로 넉넉하게)
-GROUP_CONTENT_LIMIT = 8000
-
-
-def _group_files(changed_files: list[str], repo_dir: Path) -> dict[str, list[str]]:
-    """
-    변경 파일을 디렉토리 단위로 묶되, 합산 크기가 GROUP_CONTENT_LIMIT를 초과하면
-    파일명(stem) 단위로 분할한다.
-    """
-    # 1단계: 디렉토리 단위 그룹핑
-    dir_groups: dict[str, list[str]] = {}
-    for file_path in changed_files:
-        full_path = repo_dir / file_path
-        if not full_path.exists() or full_path.suffix not in TARGET_EXTENSIONS:
-            continue
-        dir_key = str(Path(file_path).parent)
-        dir_groups.setdefault(dir_key, []).append(file_path)
-
-    # 2단계: 큰 그룹은 stem 단위로 분할
-    final_groups: dict[str, list[str]] = {}
-    for dir_key, files in dir_groups.items():
-        total_size = sum((repo_dir / f).stat().st_size for f in files)
-        if total_size <= GROUP_CONTENT_LIMIT:
-            final_groups[dir_key] = files
-        else:
-            for fp in files:
-                stem_key = str(Path(fp).parent / Path(fp).stem)
-                final_groups.setdefault(stem_key, []).append(fp)
-
-    return final_groups
-
-
-def _find_matching_domain(context_dir: Path, file_paths: list[str]) -> str:
-    """
-    파일이 속한 도메인 문서를 찾아 핵심 섹션(시스템 개요 + 설계 패턴)을 반환한다.
-    """
-    domain_dir = context_dir / DOMAIN_DIR_NAME
-    if not domain_dir.exists():
-        return ""
-
-    # file_paths를 MD 경로로 변환하여 매칭
-    file_stems = set()
-    for fp in file_paths:
-        file_stems.add(str(Path(fp).with_suffix('.md')))
-        file_stems.add(str(Path(fp).parent) + ".md")
-
-    for md_file in domain_dir.glob("*.md"):
-        if md_file.name.startswith("_"):
-            continue
-        try:
-            content = md_file.read_text(encoding='utf-8')
-        except Exception:
-            continue
-
-        # source_documents 파싱
-        sources = set(re.findall(r'-\s+(\S+\.md)', content))
-        if not sources:
-            continue
-
-        # 파일이 이 도메인에 속하는지 확인
-        if not (file_stems & sources):
-            continue
-
-        # 시스템 개요 + 설계 패턴 섹션 추출 (1500자 이내)
-        sections = []
-        for header in ("## 시스템 개요", "## 클래스 간 관계", "## 설계 패턴"):
-            match = re.search(
-                rf'({header}\s*\n)(.*?)(?=\n## |\Z)',
-                content, re.DOTALL,
-            )
-            if match:
-                sections.append(match.group(1) + match.group(2).strip())
-
-        if sections:
-            domain_text = "\n\n".join(sections)
-            return domain_text[:1500]
-
-    return ""
-
-
-def _build_related_context(base_dir: Path, file_path: str, context: str) -> str:
-    """
-    파일의 컨텍스트 요약을 검색 쿼리로 사용하여 관련 파일 컨텍스트를 수집한다.
-    반환: 관련 컨텍스트 문자열 (없으면 빈 문자열)
-    """
-    query = Path(file_path).stem
-    if context:
-        body = re.sub(r'^---\s*\n.*?\n---\s*\n', '', context, count=1, flags=re.DOTALL).strip()
-        query += " " + body[:200]
-
-    results = search_related_contexts(base_dir, query, n_results=3)
-    if not results:
-        return ""
-
-    file_stem = Path(file_path).with_suffix('.md').name
-    related = []
-    for r in results:
-        if file_stem in r.get("file", ""):
-            continue
-        preview = r.get("content_preview", "")[:400]
-        if preview:
-            related.append(f"[{r.get('file', '?')}]\n{preview}")
-
-    return "\n\n".join(related) if related else ""
-
-
-def _process_directory_group(
-    repo_dir: Path, context_dir: Path, base_dir: Path,
-    dir_key: str, file_paths: list[str],
-    auto_review: bool, use_gemini: bool,
-) -> dict:
-    """
-    디렉토리(모듈) 단위로 컨텍스트 MD 생성 + 코드 리뷰를 한 번의 LLM 호출로 수행한다.
-    반환: {"context_msg": ..., "review": ...} or partial
-    """
-    file_paths.sort(key=lambda f: (
-        0 if Path(f).suffix in HEADER_EXTENSIONS else 1,
-        Path(f).name,
-    ))
-
-    combined_content = ""
-    included_paths = []
-    for fp in file_paths:
-        try:
-            text = (repo_dir / fp).read_text(encoding='utf-8', errors='ignore')
-        except Exception:
-            continue
-        included_paths.append(fp)
-        combined_content += f"// ── {fp} ──\n{text}\n\n"
-
-    if not included_paths:
-        return {}
-
-    # 기존 코멘트 보존
-    out_path = context_dir / (dir_key + ".md")
-    existing_comments = ""
-    if out_path.exists():
-        try:
-            existing_comments = _extract_comments_section(
-                out_path.read_text(encoding='utf-8')
-            )
-        except Exception:
-            pass
-
-    # 관련 컨텍스트 검색 (기존 벡터 인덱스 활용)
-    existing_context = ""
-    if out_path.exists():
-        try:
-            existing_context = out_path.read_text(encoding='utf-8')
-        except Exception:
-            pass
-
-    # 도메인 컨텍스트 검색 (시스템 수준 맥락)
-    domain_ctx = _find_matching_domain(context_dir, included_paths)
-    domain_notice = ""
-    if domain_ctx:
-        domain_notice = f"\n\n[도메인 컨텍스트 — 이 파일이 속한 시스템의 전체 구조]\n{domain_ctx}\n"
-
-    related = _build_related_context(base_dir, included_paths[0], existing_context)
-    related_notice = ""
-    if related:
-        related_notice = f"\n\n[관련 파일 컨텍스트 — 의존 관계와 연동 로직 참고]\n{related}\n"
-
-    dev_comments = _extract_comments_section(existing_context) if existing_context else ""
-    comments_notice = ""
-    if dev_comments:
-        comments_notice = (
-            f"\n\n[개발자 코멘트 — 아래 항목은 이미 인지된 사항이므로 동일 지적을 생략하거나 "
-            f"'인지됨'으로 표기해줘]\n{dev_comments}\n"
-        )
-
-    # ── 프롬프트 구성: 컨텍스트 MD + 코드 리뷰를 한번에 ──
-    file_path_str = " + ".join(included_paths)
-    code_block = combined_content[:GROUP_CONTENT_LIMIT]
-
-    if auto_review:
-        prompt = (
-            f"아래 코드 파일들을 분석하여 두 가지 작업을 수행해줘.\n"
-            f"반드시 === 구분자로 두 섹션을 나눠줘.\n\n"
-            f"=== CONTEXT_MD ===\n"
-            f"RAG 컨텍스트 MD를 생성해줘. 반드시 아래 형식을 지켜:\n"
-            f"---\n"
-            f"tags: [태그1, 태그2, ...]\n"
-            f"category: 대분류/중분류/소분류\n"
-            f"related_classes:\n"
-            f"  - ClassName: file_path\n"
-            f"---\n\n"
-            f"## 요약\n(기능과 역할 요약)\n\n"
-            f"## 개선 필요 사항\n(알려진 이슈, 기술 부채. 없으면 \"없음\")\n\n"
-            f"주의: \"## 코멘트\" 섹션은 절대 생성하지 마.\n\n"
-            f"=== CODE_REVIEW ===\n"
-            f"같은 모듈의 파일들이므로 클래스 간 의존 관계, 인터페이스 일관성도 함께 확인해줘.\n\n"
-            f"## 1. 코딩 컨벤션 검토\n"
-            f"검토 기준: 클래스명 파스칼케이스, 함수명 파스칼케이스, "
-            f"멤버변수 접두사(b/f/i), public 함수 주석 필수.\n"
-            f"결과: | 파일 | 항목 | 위반 내용 | 라인 | 심각도 |\n\n"
-            f"## 2. 버그·안전성 검토\n"
-            f"Null 포인터, 메모리 누수, 멀티스레드 안전성, 배열 범위 초과, 미초기화 변수를 검토.\n"
-            f"결과: | 파일 | 위험도 | 라인 | 설명 | 권장 수정 |"
-            f"{domain_notice}"
-            f"{comments_notice}"
-            f"{related_notice}\n\n"
-            f"파일 경로: {file_path_str}\n"
-            f"```\n{code_block}\n```"
-        )
-    else:
-        prompt = PROMPT_TEMPLATES["01_소스분석"].format(
-            file_path=file_path_str,
-            content=code_block,
-        )
-
-    group_name = Path(dir_key).name
-    file_list = ", ".join(Path(f).name for f in included_paths)
-    print(f"  [분석] {group_name} ({len(included_paths)}개: {file_list})")
-
-    raw = _call_llm(prompt, use_gemini=use_gemini)
-    if raw is None:
-        return {}
-
-    result = {}
-
-    # ── 응답 파싱: CONTEXT_MD / CODE_REVIEW 분리 ──
-    if auto_review and "=== CODE_REVIEW ===" in raw:
-        parts = raw.split("=== CODE_REVIEW ===", 1)
-        context_md = parts[0].replace("=== CONTEXT_MD ===", "").strip()
-        review_text = parts[1].strip()
-        result["review"] = {"file": dir_key, "review": review_text}
-    elif auto_review and "=== CONTEXT_MD ===" in raw:
-        # CODE_REVIEW 마커 없이 CONTEXT_MD만 있는 경우
-        context_md = raw.replace("=== CONTEXT_MD ===", "").strip()
-    else:
-        context_md = raw.strip()
-
-    # ── 컨텍스트 MD 저장 ──
-    if existing_comments:
-        context_md = re.sub(r'## 코멘트\s*\n.*', '', context_md, flags=re.DOTALL).rstrip()
-        context_md = context_md + "\n\n" + existing_comments + "\n"
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(context_md, encoding='utf-8')
-    result["context_msg"] = f"  [분석] {out_path.relative_to(context_dir.parent.parent)} ({len(included_paths)}개 파일)"
-
-    return result
-
-
-def process_commit(
-    repo_dir: Path, context_dir: Path, reviews_dir: Path,
-    changed_files: list[str], commit_hash: str,
-    auto_review: bool = True, use_gemini: bool = False,
-):
-    """
-    컨텍스트 생성 + 코드 리뷰를 디렉토리(모듈) 단위로 한 번에 처리한다.
-    LLM 1회 호출로 두 작업을 동시 수행하여 시간을 절반으로 줄인다.
-    """
-    base_dir = context_dir.parent.parent
-    groups = _group_files(changed_files, repo_dir)
-    if not groups:
-        log("소스 파일 없음 — 건너뜀")
-        return
-
-    total_files = sum(len(fps) for fps in groups.values())
-    mode = "컨텍스트+리뷰" if auto_review else "컨텍스트"
-    log(f"{mode} 시작 — {total_files}개 파일, {len(groups)}개 모듈 (병렬 {MAX_WORKERS})")
-
-    all_reviews: list[dict] = []
-    success, fail = 0, 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _process_directory_group,
-                repo_dir, context_dir, base_dir, dk, fps, auto_review, use_gemini,
-            ): dk
-            for dk, fps in groups.items()
-        }
-        for future in as_completed(futures):
-            dk = futures[future]
-            try:
-                result = future.result()
-                if result.get("context_msg"):
-                    print(result["context_msg"])
-                    success += 1
-                else:
-                    fail += 1
-                if result.get("review"):
-                    all_reviews.append(result["review"])
-            except Exception as e:
-                log(f"[경고] 처리 실패 ({dk}): {e}")
-                fail += 1
-
-    if fail:
-        log(f"처리: {success}개 성공, {fail}개 실패")
-
-    # 벡터 인덱스 갱신
-    log("벡터 인덱스 갱신 중...")
-    update_vector_index(context_dir, base_dir, changed_files)
-    log("벡터 인덱스 갱신 완료")
-
-    # 리뷰 리포트 저장
-    if all_reviews:
-        report = _build_review_report(all_reviews, commit_hash)
-        timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-        report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}.md"
-        report_path.write_text(report, encoding='utf-8')
-        log(f"코드 리뷰 완료 → {report_path.relative_to(reviews_dir.parent.parent)}")
-
-
-def _build_review_report(file_reviews: list[dict], commit_hash: str) -> str:
-    """모듈별 리뷰 결과를 직접 취합하여 통합 리포트를 생성한다. (LLM 호출 없음)"""
-    file_reviews.sort(key=lambda r: r["file"])
-
-    modules_section = "\n\n---\n\n".join(
-        f"### {Path(r['file']).name}/\n{r['review']}"
-        for r in file_reviews
-    )
-
-    return (
-        f"# 코드 리뷰 리포트\n\n"
-        f"커밋: `{commit_hash}`  \n"
-        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n"
-        f"검토 모듈: {len(file_reviews)}개\n\n"
-        f"---\n\n"
-        f"{modules_section}"
-    )
-
-
-def initial_context_build(
-    repo_dir: Path, context_dir: Path, base_dir: Path,
-    use_gemini: bool = False,
-):
-    """
-    기존 소스 파일 중 컨텍스트 MD가 없는 모듈을 일괄 생성한다.
-    최초 설치 시 전체 RAG를 초기화하며, 중단 후 재실행 시 누락분만 보충한다.
-    """
-    all_files = _list_all_source_files(repo_dir)
-    if not all_files:
-        log("소스 파일 없음 — 초기 컨텍스트 생성 건너뜀")
-        return
-
-    groups = _group_files(all_files, repo_dir)
-
-    # 이미 MD가 있는 그룹 제외 (중단 후 재실행 시 누락분만 처리)
-    missing: dict[str, list[str]] = {}
-    for dir_key, files in groups.items():
-        md_path = context_dir / (dir_key + ".md")
-        if not md_path.exists():
-            missing[dir_key] = files
-
-    if not missing:
-        return
-
-    total_modules = len(missing)
-    total_files = sum(len(f) for f in missing.values())
-    log(f"초기 컨텍스트 생성 시작 — {total_modules}개 모듈, {total_files}개 파일 (병렬 {MAX_WORKERS})")
-
-    completed = 0
-    success = 0
-    fail = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _process_directory_group,
-                repo_dir, context_dir, base_dir, dk, fps,
-                False,  # auto_review=False (컨텍스트만 생성)
-                use_gemini,
-            ): dk
-            for dk, fps in missing.items()
-        }
-        for future in as_completed(futures):
-            dk = futures[future]
-            completed += 1
-            try:
-                result = future.result()
-                if result.get("context_msg"):
-                    success += 1
-                else:
-                    fail += 1
-            except Exception as e:
-                log(f"[경고] 초기화 실패 ({dk}): {e}")
-                fail += 1
-            if completed % 10 == 0 or completed == total_modules:
-                log(f"초기화 진행: {completed}/{total_modules} (성공: {success}, 실패: {fail})")
-
-    log(f"초기 컨텍스트 생성 완료 — 성공: {success}, 실패: {fail}")
-
-    # 벡터 인덱스 전체 구축
-    log("벡터 인덱스 전체 구축 중...")
-    update_vector_index(context_dir, base_dir)  # changed_files=None → rebuild
-    log("벡터 인덱스 구축 완료")
-
-
-# ─────────────────────────────────────────
-# 도메인 자동 승급 (데이터 → 정보)
-# ─────────────────────────────────────────
-
-DOMAIN_DIR_NAME = "_domains"
-COOCCURRENCE_THRESHOLD = 5   # 동시 출현 최소 횟수
-DOMAIN_MIN_DOCS = 2          # 도메인 최소 문서 수
-DOMAIN_CHECK_INTERVAL = 10   # N번째 폴링마다 도메인 체크
-
-
-def _analyze_search_patterns(base_dir: Path) -> list[list[str]]:
-    """
-    검색 로그를 분석하여 자주 함께 검색되는 문서 클러스터를 식별한다.
-    반환: [[doc1, doc2, ...], [doc3, doc4], ...] 형태의 클러스터 목록
-    """
-    log_path = base_dir / ".claude" / "search_log.jsonl"
-    if not log_path.exists():
-        return []
-
-    # 1) 로그에서 결과 문서 목록 수집
-    search_sessions: list[list[str]] = []
-    try:
-        for line in log_path.read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            results = entry.get("results", [])
-            # 도메인 문서 자체는 제외
-            results = [r for r in results if DOMAIN_DIR_NAME + "/" not in r]
-            if len(results) >= 2:
-                search_sessions.append(results)
-    except Exception:
-        return []
-
-    if not search_sessions:
-        return []
-
-    # 2) 문서 쌍의 동시 출현 빈도 카운트
-    from collections import Counter
-    pair_counts: Counter = Counter()
-    for session in search_sessions:
-        docs = sorted(set(session))
-        for i in range(len(docs)):
-            for j in range(i + 1, len(docs)):
-                pair_counts[frozenset([docs[i], docs[j]])] += 1
-
-    # 3) 임계값 이상인 쌍으로 그래프 구축 + 연결 요소 추출
-    strong_pairs = [pair for pair, cnt in pair_counts.items()
-                    if cnt >= COOCCURRENCE_THRESHOLD]
-    if not strong_pairs:
-        return []
-
-    # Union-Find로 클러스터링
-    parent: dict[str, str] = {}
-
-    def find(x: str) -> str:
-        while parent.get(x, x) != x:
-            parent[x] = parent.get(parent[x], parent[x])
-            x = parent[x]
-        return x
-
-    def union(a: str, b: str):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    for pair in strong_pairs:
-        a, b = list(pair)
-        parent.setdefault(a, a)
-        parent.setdefault(b, b)
-        union(a, b)
-
-    # 클러스터 수집
-    clusters: dict[str, list[str]] = {}
-    for doc in parent:
-        root = find(doc)
-        clusters.setdefault(root, []).append(doc)
-
-    return [docs for docs in clusters.values() if len(docs) >= DOMAIN_MIN_DOCS]
-
-
-def _get_existing_domains(context_dir: Path) -> dict[str, set[str]]:
-    """기존 도메인 문서와 그 소스 문서 목록을 반환한다."""
-    domain_dir = context_dir / DOMAIN_DIR_NAME
-    if not domain_dir.exists():
-        return {}
-
-    domains: dict[str, set[str]] = {}
-    for md_file in domain_dir.glob("*.md"):
-        try:
-            content = md_file.read_text(encoding='utf-8')
-            # source_documents 파싱
-            sources: set[str] = set()
-            in_sources = False
-            for line in content.splitlines():
-                if line.strip().startswith("source_documents:"):
-                    in_sources = True
-                    continue
-                if in_sources:
-                    if line.strip().startswith("- "):
-                        sources.add(line.strip()[2:].strip())
-                    elif line.strip() and not line.startswith(" "):
-                        break
-            domains[md_file.stem] = sources
-        except Exception:
-            continue
-    return domains
-
-
-def _cleanup_stale_domains(context_dir: Path):
-    """소스 문서가 50% 이상 사라진 stale 도메인을 삭제한다."""
-    existing = _get_existing_domains(context_dir)
-    domain_dir = context_dir / DOMAIN_DIR_NAME
-    if not domain_dir.exists():
-        return
-
-    for domain_name, sources in existing.items():
-        if not sources:
-            continue
-        alive = sum(1 for s in sources if (context_dir / s).exists())
-        if alive < len(sources) * 0.5:
-            md_path = domain_dir / f"{domain_name}.md"
-            md_path.unlink(missing_ok=True)
-            log(f"stale 도메인 삭제: {domain_name} (소스 {alive}/{len(sources)} 존재)")
-
-
-def _generate_architecture_overview(context_dir: Path, use_gemini: bool = False):
-    """
-    도메인 문서가 3개 이상이면 전체를 종합한 아키텍처 개요를 생성한다.
-    _domains/_overview.md에 저장한다.
-    """
-    domain_dir = context_dir / DOMAIN_DIR_NAME
-    if not domain_dir.exists():
-        return
-
-    domain_files = [f for f in domain_dir.glob("*.md") if not f.name.startswith("_")]
-    if len(domain_files) < 3:
-        return
-
-    # 각 도메인의 시스템 개요를 수집
-    summaries = []
-    for md_file in sorted(domain_files):
-        try:
-            content = md_file.read_text(encoding='utf-8')
-            overview_m = re.search(r'## 시스템 개요\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
-            if overview_m:
-                summaries.append(f"### {md_file.stem}\n{overview_m.group(1).strip()}")
-        except Exception:
-            continue
-
-    if len(summaries) < 3:
-        return
-
-    prompt = (
-        f"아래는 프로젝트의 주요 시스템(도메인) 목록이다.\n"
-        f"이 도메인들을 종합하여 '프로젝트 아키텍처 개요'를 생성해줘.\n\n"
-        f"형식:\n"
-        f"---\n"
-        f"tags: [아키텍처, 개요]\n"
-        f"category: 도메인/아키텍처개요\n"
-        f"type: overview\n"
-        f"---\n\n"
-        f"## 프로젝트 구조 요약\n"
-        f"(전체 시스템의 큰 그림을 3~5문장으로)\n\n"
-        f"## 시스템 간 관계\n"
-        f"(도메인들이 어떻게 연결되는지, 데이터가 어떻게 흐르는지)\n\n"
-        f"## 핵심 진입점\n"
-        f"(새로운 팀원이 가장 먼저 봐야 할 시스템과 파일)\n\n"
-        f"주의: '## 코멘트' 섹션은 생성하지 마.\n\n"
-        f"=== 도메인 목록 ===\n\n"
-        + "\n\n".join(summaries)
-    )
-
-    raw = _call_llm(prompt, use_gemini=use_gemini)
-    if not raw:
-        return
-
-    overview_path = domain_dir / "_overview.md"
-    # 기존 코멘트 보존
-    overview_content = raw.strip()
-    if overview_path.exists():
-        existing_comments = _extract_comments_section(
-            overview_path.read_text(encoding='utf-8')
-        )
-        if existing_comments:
-            overview_content = re.sub(
-                r'## 코멘트\s*\n.*', '', overview_content, flags=re.DOTALL
-            ).rstrip()
-            overview_content = overview_content + "\n\n" + existing_comments + "\n"
-    overview_path.write_text(overview_content, encoding='utf-8')
-    log(f"아키텍처 개요 갱신: {len(domain_files)}개 도메인 종합")
-
-
-def promote_domains(
-    base_dir: Path, context_dir: Path,
-    use_gemini: bool = False,
-):
-    """
-    검색 로그를 분석하여 자주 함께 검색되는 문서 클러스터를
-    도메인 문서로 승급시킨다.
-    """
-    # stale 도메인 정리
-    _cleanup_stale_domains(context_dir)
-
-    clusters = _analyze_search_patterns(base_dir)
-    if not clusters:
-        return
-
-    existing = _get_existing_domains(context_dir)
-    domain_dir = context_dir / DOMAIN_DIR_NAME
-    domain_dir.mkdir(parents=True, exist_ok=True)
-
-    # 이미 도메인으로 만들어진 클러스터인지 확인
-    new_clusters = []
-    for cluster in clusters:
-        cluster_set = set(cluster)
-        already = False
-        for domain_sources in existing.values():
-            # 소스 문서의 80% 이상이 겹치면 이미 존재하는 도메인
-            if len(cluster_set & domain_sources) >= len(cluster_set) * 0.8:
-                already = True
-                break
-        if not already:
-            new_clusters.append(cluster)
-
-    if not new_clusters:
-        return
-
-    log(f"도메인 승급 후보: {len(new_clusters)}개 클러스터")
-
-    for cluster in new_clusters:
-        # 클러스터 내 문서들의 컨텍스트 MD 읽기
-        doc_contents = []
-        for doc_file in sorted(cluster):
-            md_path = context_dir / doc_file
-            if md_path.exists():
-                try:
-                    content = md_path.read_text(encoding='utf-8')
-                    doc_contents.append(f"[{doc_file}]\n{content}")
-                except Exception:
-                    continue
-
-        if len(doc_contents) < DOMAIN_MIN_DOCS:
-            continue
-
-        # LLM으로 도메인 문서 생성
-        source_list = "\n".join(f"  - {d}" for d in sorted(cluster))
-        prompt = (
-            f"아래는 자주 함께 검색되는 관련 코드 컨텍스트들이다.\n"
-            f"이 문서들을 종합하여 하나의 '도메인 문서'를 생성해줘.\n\n"
-            f"반드시 아래 형식을 지켜줘:\n"
-            f"---\n"
-            f"tags: [태그1, 태그2, ...]\n"
-            f"category: 도메인/<도메인명>\n"
-            f"type: domain\n"
-            f"source_documents:\n{source_list}\n"
-            f"---\n\n"
-            f"## 시스템 개요\n"
-            f"(이 기능/시스템이 하는 일, 주요 컴포넌트 역할)\n\n"
-            f"## 클래스 간 관계\n"
-            f"(상호작용, 의존 관계, 호출 흐름)\n\n"
-            f"## 데이터 흐름\n"
-            f"(주요 데이터가 어떻게 이동하고 변환되는지)\n\n"
-            f"## 설계 패턴 및 확장 포인트\n"
-            f"(사용된 패턴, 수정 시 주의할 지점)\n\n"
-            f"주의:\n"
-            f"- 도메인명은 한글로, 이 기능/시스템을 대표하는 이름으로 지어줘\n"
-            f"- '## 코멘트' 섹션은 생성하지 마\n\n"
-            f"=== 소스 문서들 ===\n\n"
-            + "\n\n---\n\n".join(doc_contents)
-        )
-
-        raw = _call_llm(prompt, use_gemini=use_gemini)
-        if not raw:
-            continue
-
-        # 도메인명 추출 (category에서)
-        cat_match = re.search(r'category:\s*도메인/(.+)', raw)
-        domain_name = cat_match.group(1).strip() if cat_match else f"도메인_{len(existing) + 1}"
-        # 파일명에 사용할 수 없는 문자 제거
-        safe_name = re.sub(r'[\\/:*?"<>|]', '_', domain_name)
-
-        out_path = domain_dir / f"{safe_name}.md"
-        # 기존 코멘트 보존
-        domain_content = raw.strip()
-        if out_path.exists():
-            existing_comments = _extract_comments_section(
-                out_path.read_text(encoding='utf-8')
-            )
-            if existing_comments:
-                domain_content = re.sub(
-                    r'## 코멘트\s*\n.*', '', domain_content, flags=re.DOTALL
-                ).rstrip()
-                domain_content = domain_content + "\n\n" + existing_comments + "\n"
-        out_path.write_text(domain_content, encoding='utf-8')
-        log(f"도메인 승급: {safe_name} ({len(cluster)}개 문서 종합)")
-
-    # 도메인 3개 이상이면 아키텍처 맵 자동 생성
-    _generate_architecture_overview(context_dir, use_gemini)
-
-    # 도메인 문서 포함하여 벡터 인덱스 재구축
-    log("도메인 반영 — 벡터 인덱스 갱신 중...")
-    update_vector_index(context_dir, base_dir)
-    log("벡터 인덱스 갱신 완료")
-
-
-HEALTH_CHECK_INTERVAL = 50  # N번째 폴링마다 건강도 리포트 생성
-
-
-def generate_health_report(base_dir: Path, context_dir: Path, reviews_dir: Path):
-    """
-    도메인별 기술 부채, 리뷰 지적 빈도, 미해결 고민을 집계하여
-    프로젝트 건강도 리포트를 생성한다. LLM 호출 없이 파일 파싱만으로 동작.
-    """
-    existing_domains = _get_existing_domains(context_dir)
-    if not existing_domains:
-        return
-
-    domain_stats: dict[str, dict] = {}
-
-    for domain_name, sources in existing_domains.items():
-        stats = {"issues": 0, "comments": 0, "concerns": 0, "files": len(sources)}
-
-        # 소스 문서에서 개선 필요 사항 / 코멘트 집계
-        for src in sources:
-            md_path = context_dir / src
-            if not md_path.exists():
-                continue
-            try:
-                content = md_path.read_text(encoding='utf-8')
-            except Exception:
-                continue
-
-            # "## 개선 필요 사항" 항목 수 카운트
-            improve_m = re.search(r'## 개선 필요 사항\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
-            if improve_m:
-                text = improve_m.group(1).strip()
-                if text and text != "없음":
-                    stats["issues"] += text.count("\n") + 1
-
-            # 코멘트 집계
-            comments = _extract_comments_section(content)
-            if comments:
-                stats["comments"] += comments.count("\n") + 1
-                stats["concerns"] += comments.count("[고민]")
-
-        domain_stats[domain_name] = stats
-
-    # 리뷰 리포트에서 도메인별 지적 빈도 (최근 20개 리뷰)
-    review_files = sorted(reviews_dir.glob("*.md"), reverse=True)[:20]
-    domain_review_counts: dict[str, int] = {d: 0 for d in existing_domains}
-    for rf in review_files:
-        try:
-            review_content = rf.read_text(encoding='utf-8')
-            for domain_name, sources in existing_domains.items():
-                for src in sources:
-                    stem = Path(src).stem
-                    if stem in review_content:
-                        domain_review_counts[domain_name] += 1
-                        break
-        except Exception:
-            continue
-
-    # 리포트 생성
-    lines = [
-        "# 프로젝트 건강도 리포트\n",
-        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n",
-        "\n## 도메인별 현황\n",
-        "| 도메인 | 소스 파일 | 개선 사항 | 코멘트 | 미결 고민 | 리뷰 지적 |",
-        "|--------|----------|----------|--------|----------|----------|",
-    ]
-    for domain_name, stats in sorted(domain_stats.items()):
-        review_count = domain_review_counts.get(domain_name, 0)
-        lines.append(
-            f"| {domain_name} | {stats['files']} | {stats['issues']} | "
-            f"{stats['comments']} | {stats['concerns']} | {review_count} |"
-        )
-
-    # 주의 필요 도메인
-    high_debt = [d for d, s in domain_stats.items() if s["issues"] >= 5]
-    high_concerns = [d for d, s in domain_stats.items() if s["concerns"] >= 3]
-    if high_debt or high_concerns:
-        lines.append("\n## 주의 필요\n")
-        if high_debt:
-            lines.append(f"- **기술 부채 높음**: {', '.join(high_debt)}")
-        if high_concerns:
-            lines.append(f"- **미결 고민 많음**: {', '.join(high_concerns)}")
-
-    report_path = reviews_dir / "_health_report.md"
-    report_path.write_text("\n".join(lines), encoding='utf-8')
-    log(f"건강도 리포트 갱신 → {report_path.relative_to(base_dir)}")
-
-
-# 기본 모델 (config.json의 claude_model로 오버라이드 가능)
-_claude_model: str = "claude-sonnet-4-6"
-
-
-def set_claude_model(model: str):
-    global _claude_model
-    _claude_model = model
-
-
-def _call_claude(prompt: str) -> str | None:
-    """Claude CLI를 호출하고 결과 텍스트를 반환한다. stdin으로 프롬프트 전달 (Windows 명령줄 길이 제한 회피)."""
-    cmd = ["claude", "-p", "--dangerously-skip-permissions"]
-    if _claude_model:
-        cmd.extend(["--model", _claude_model])
-    result = subprocess.run(
-        cmd, input=prompt,
-        capture_output=True, text=True, encoding='utf-8',
-    )
-    if result.returncode != 0:
-        print(f"[오류] Claude 호출 실패: {result.stderr[:200]}")
-        return None
-    return result.stdout
-
-
-def _call_gemini(prompt: str) -> str | None:
-    """Gemini CLI를 호출하고 결과 텍스트를 반환한다. 실패 시 None."""
-    if not shutil.which("gemini"):
-        print("[경고] Gemini CLI를 찾을 수 없어 Claude로 대체합니다.")
-        return _call_claude(prompt)
-    result = subprocess.run(
-        ["gemini", "-y", prompt],
-        capture_output=True, text=True, encoding='utf-8', errors='replace'
-    )
-    if result.returncode != 0:
-        print(f"[오류] Gemini 호출 실패: {result.stderr[:200]}")
-        return None
-    return result.stdout
-
-
-def _call_llm(prompt: str, use_gemini: bool = False) -> str | None:
-    """use_gemini 플래그에 따라 Gemini 또는 Claude를 호출한다."""
-    if use_gemini:
-        return _call_gemini(prompt)
-    return _call_claude(prompt)
-
-
-# ─────────────────────────────────────────
-# 에셋 검증 (커맨드렛)
-# ─────────────────────────────────────────
-
-def _find_uproject(base_dir: Path) -> Path | None:
-    for p in base_dir.glob("*.uproject"):
-        return p
-    return None
-
-
-def _find_unreal_editor(base_dir: Path) -> tuple[str | None, str | None]:
-    """(editor_path, uproject_path) 반환. 탐색 실패 시 None."""
-    uproject = _find_uproject(base_dir)
-    if not uproject:
-        return None, None
-
-    try:
-        with open(uproject, encoding='utf-8') as f:
-            version = json.load(f).get("EngineAssociation", "")
-    except Exception:
-        return None, str(uproject)
-
-    # 1. 레지스트리 탐색
-    editor = None
-    try:
-        import winreg
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            for arch in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_32KEY):
-                try:
-                    key = winreg.OpenKey(
-                        hive,
-                        f"SOFTWARE\\EpicGames\\Unreal Engine\\{version}",
-                        access=arch
-                    )
-                    install_dir, _ = winreg.QueryValueEx(key, "InstalledDirectory")
-                    for exe in ("UnrealEditor-Cmd.exe", "UE4Editor-Cmd.exe"):
-                        candidate = Path(install_dir) / "Engine" / "Binaries" / "Win64" / exe
-                        if candidate.exists():
-                            editor = str(candidate)
-                            break
-                except Exception:
-                    continue
-            if editor:
-                break
-    except ImportError:
-        pass
-
-    # 2. 환경변수 탐색
-    if not editor:
-        import os
-        pf = os.environ.get("ProgramFiles", "C:\\Program Files")
-        for ue_dir in Path(pf, "Epic Games").glob(f"UE_{version}*"):
-            for exe in ("UnrealEditor-Cmd.exe", "UE4Editor-Cmd.exe"):
-                candidate = ue_dir / "Engine" / "Binaries" / "Win64" / exe
-                if candidate.exists():
-                    editor = str(candidate)
-                    break
-
-    return editor, str(uproject)
-
-
-def run_asset_validation(
-    base_dir: Path,
-    reviews_dir: Path,
-    changed_files: list[str],
-    commit_hash: str,
-    use_gemini: bool = False,
-):
-    """변경된 .uasset / .umap 파일에 대해 DataValidation 커맨드렛을 실행한다."""
-    assets = [f for f in changed_files if Path(f).suffix in ASSET_EXTENSIONS]
-    if not assets:
-        return
-
-    log(f"에셋 검증 시작 — {len(assets)}개 파일")
-
-    editor, uproject = _find_unreal_editor(base_dir)
-    if not editor:
-        log("[경고] UnrealEditor-Cmd.exe를 찾을 수 없어 에셋 검증을 건너뜁니다.")
-        return
-
-    try:
-        result = subprocess.run(
-            [editor, uproject,
-             "-run=DataValidation", "-log", "-unattended", "-nullrhi"],
-            capture_output=True, text=True,
-            encoding='utf-8', errors='replace', timeout=300
-        )
-        raw_output = result.stdout + result.stderr
-    except subprocess.TimeoutExpired:
-        log("[경고] 커맨드렛 타임아웃 (300초) — 에셋 검증 중단")
-        return
-    except Exception as e:
-        log(f"[오류] 커맨드렛 실행 실패: {e}")
-        return
-
-    log("에셋 검증 결과 분석 중...")
-    prompt = (
-        f"아래는 UE5 DataValidation 커맨드렛 실행 결과입니다.\n"
-        f"변경된 에셋 목록:\n" +
-        "\n".join(f"  - {a}" for a in assets) +
-        f"\n\n커맨드렛 출력 (마지막 6000자):\n```\n{raw_output[-6000:]}\n```\n\n"
-        f"다음 형식으로 분석해줘:\n"
-        f"## 검증 요약\n"
-        f"## 에러 목록 (에셋별)\n"
-        f"## 경고 목록\n"
-        f"## 수정 필요 항목"
-    )
-
-    analysis = _call_llm(prompt, use_gemini=use_gemini)
-
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H%M')
-    report_path = reviews_dir / f"{timestamp}_{commit_hash[:8]}_assets.md"
-    report_path.write_text(
-        f"# 에셋 검증 리포트\n\n"
-        f"커밋: `{commit_hash}`  \n"
-        f"생성: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"## 검증 대상 에셋\n" +
-        "\n".join(f"- `{a}`" for a in assets) +
-        f"\n\n{analysis or '(분석 결과 없음)'}",
-        encoding='utf-8'
-    )
-    log(f"에셋 검증 완료 → {report_path.relative_to(base_dir)}")
-
-
 # ─────────────────────────────────────────
 # 상태 저장
 # ─────────────────────────────────────────
 
 def load_state(base_dir: Path) -> str | None:
-    state_path = base_dir / STATE_FILE
+    state_path = base_dir / common.STATE_FILE
     return state_path.read_text().strip() if state_path.exists() else None
 
 
 def save_state(base_dir: Path, commit_hash: str):
-    (base_dir / STATE_FILE).write_text(commit_hash)
-
-
-def log(msg: str):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    (base_dir / common.STATE_FILE).write_text(commit_hash)
 
 
 # ─────────────────────────────────────────
@@ -1785,7 +326,7 @@ def main():
 
     try:
         repo_dir = find_git_repo(base_dir)
-        log(f"Git 저장소 감지: {repo_dir}")
+        common.log(f"Git 저장소 감지: {repo_dir}")
     except RuntimeError as e:
         print(f"\n[오류] {e}")
         input("\nEnter 키를 눌러 종료...")
@@ -1798,23 +339,22 @@ def main():
     auto_asset_validation = config.get("auto_asset_validation", True)
     use_gemini = config.get("use_gemini", False) and bool(shutil.which("gemini"))
 
-    # Claude 모델 설정 (기본값: sonnet — 속도와 품질의 균형)
+    # Claude 모델 설정 (기본값: sonnet -- 속도와 품질의 균형)
     claude_model = config.get("claude_model", "claude-sonnet-4-6")
-    set_claude_model(claude_model)
+    common.set_claude_model(claude_model)
 
     # ── 서버 모드 설정 ──
-    global _server_mode, _server_url, _server_proc
-    _server_mode = config.get("server_mode", False)
+    common._server_mode = config.get("server_mode", False)
     server_port = config.get("server_port", 8100)
     server_host = config.get("server_host", "0.0.0.0")
 
-    if _server_mode:
-        _server_url = f"http://localhost:{server_port}"
+    if common._server_mode:
+        common._server_url = f"http://localhost:{server_port}"
         # context_search HTTP 서버를 백그라운드 프로세스로 시작
         cmd = _get_context_search_cmd(base_dir)
         if cmd:
             serve_cmd = cmd + ["--serve", str(base_dir), str(server_port), server_host]
-            _server_proc = subprocess.Popen(
+            common._server_proc = subprocess.Popen(
                 serve_cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 encoding='utf-8', errors='replace',
@@ -1824,35 +364,35 @@ def main():
             import urllib.error
             for _ in range(30):
                 try:
-                    with urllib.request.urlopen(f"{_server_url}/api/v1/health", timeout=2):
+                    with urllib.request.urlopen(f"{common._server_url}/api/v1/health", timeout=2):
                         break
                 except Exception:
                     time.sleep(0.5)
             else:
-                log("[경고] HTTP 서버 시작 대기 타임아웃")
-            log(f"컨텍스트 HTTP 서버: {server_host}:{server_port}")
+                common.log("[경고] HTTP 서버 시작 대기 타임아웃")
+            common.log(f"컨텍스트 HTTP 서버: {server_host}:{server_port}")
         else:
-            log("[경고] context_search를 찾을 수 없어 서버 모드 비활성화")
-            _server_mode = False
-            _server_url = ""
+            common.log("[경고] context_search를 찾을 수 없어 서버 모드 비활성화")
+            common._server_mode = False
+            common._server_url = ""
 
     context_dir, agents_dir, reviews_dir = init_project_dirs(base_dir)
 
     llm_label = "Gemini" if use_gemini else f"Claude ({claude_model.split('-')[1]})"
-    if _server_mode:
+    if common._server_mode:
         vector_label = f"서버 모드 (:{server_port})"
     else:
         vector_ok = bool(_get_context_search_cmd(base_dir))
         vector_label = "ON (로컬)" if vector_ok else "OFF (context_search 없음)"
-    log(
+    common.log(
         f"브랜치: {branch} | 폴링 간격: {poll_interval}초 | "
         f"자동 리뷰: {'ON' if auto_review else 'OFF'} | "
         f"에셋 검증: {'ON' if auto_asset_validation else 'OFF'} | "
         f"분석 엔진: {llm_label} | "
         f"벡터 RAG: {vector_label}"
     )
-    log(f"컨텍스트: {context_dir}")
-    log(f"리뷰 저장: {reviews_dir}")
+    common.log(f"컨텍스트: {context_dir}")
+    common.log(f"리뷰 저장: {reviews_dir}")
     print()
 
     # 초기 컨텍스트 생성 (최초 실행 시 전체 소스 분석, 중단 재실행 시 누락분 보충)
@@ -1862,18 +402,18 @@ def main():
     save_state(base_dir, last_hash)
 
     # 컨텍스트 MD는 있지만 벡터 DB가 없는 경우 대비 (DB 삭제 등)
-    if _server_mode:
-        status = _http_get("/api/v1/index/status")
+    if common._server_mode:
+        status = common._http_get("/api/v1/index/status")
         if status and status.get("indexed_documents", 0) == 0:
-            log("벡터 인덱스 초기 구축 중...")
+            common.log("벡터 인덱스 초기 구축 중...")
             update_vector_index(context_dir, base_dir)
     else:
         vector_db_path = base_dir / ".claude" / "vector_db"
         if not vector_db_path.exists():
-            log("벡터 인덱스 초기 구축 중...")
+            common.log("벡터 인덱스 초기 구축 중...")
             update_vector_index(context_dir, base_dir)
 
-    log("감시 시작... (종료: Ctrl+C)")
+    common.log("감시 시작... (종료: Ctrl+C)")
 
     poll_count = 0
     while True:
@@ -1884,36 +424,36 @@ def main():
                 try:
                     promote_domains(base_dir, context_dir, use_gemini=use_gemini)
                 except Exception as e:
-                    log(f"[경고] 도메인 체크 오류: {e}")
+                    common.log(f"[경고] 도메인 체크 오류: {e}")
 
             # 주기적 건강도 리포트 생성
             if poll_count % HEALTH_CHECK_INTERVAL == 0:
                 try:
                     generate_health_report(base_dir, context_dir, reviews_dir)
                 except Exception as e:
-                    log(f"[경고] 건강도 리포트 오류: {e}")
+                    common.log(f"[경고] 건강도 리포트 오류: {e}")
 
             if not git_fetch(repo_dir):
-                log("[경고] git fetch 실패, 재시도 대기 중...")
+                common.log("[경고] git fetch 실패, 재시도 대기 중...")
             else:
                 remote_hash = get_remote_hash(repo_dir, branch)
 
                 if remote_hash and remote_hash != last_hash:
                     # 중복 실행 방지: 이전 작업이 아직 진행 중이면 건너뜀
                     if not _processing_lock.acquire(blocking=False):
-                        log(f"[대기] 이전 작업 진행 중 — 다음 폴링에서 처리 ({remote_hash[:8]})")
+                        common.log(f"[대기] 이전 작업 진행 중 — 다음 폴링에서 처리 ({remote_hash[:8]})")
                     else:
                         try:
-                            log(f"새 커밋 감지: {last_hash[:8]} → {remote_hash[:8]}")
+                            common.log(f"새 커밋 감지: {last_hash[:8]} → {remote_hash[:8]}")
 
                             if git_pull(repo_dir, branch):
                                 # pull 후 실제 최신 해시 재확인 (작업 중 추가 커밋 대응)
                                 actual_hash = get_local_hash(repo_dir)
                                 if actual_hash != remote_hash:
-                                    log(f"추가 커밋 포함: {remote_hash[:8]} → {actual_hash[:8]}")
+                                    common.log(f"추가 커밋 포함: {remote_hash[:8]} → {actual_hash[:8]}")
 
                                 changed_files = get_changed_files(repo_dir, last_hash, actual_hash)
-                                log(f"변경된 파일 {len(changed_files)}개")
+                                common.log(f"변경된 파일 {len(changed_files)}개")
 
                                 process_commit(
                                     repo_dir, context_dir, reviews_dir,
@@ -1937,10 +477,10 @@ def main():
 
         except KeyboardInterrupt:
             print()
-            log("종료")
+            common.log("종료")
             sys.exit(0)
         except Exception as e:
-            log(f"[오류] {e}")
+            common.log(f"[오류] {e}")
 
         time.sleep(poll_interval)
 

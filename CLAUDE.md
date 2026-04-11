@@ -27,8 +27,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```
 AgentTest/                         ← 이 저장소
 ├── watcher/
-│   ├── watch.py                   ← 메인 워처 스크립트 (PyInstaller 진입점)
-│   └── agent_templates.py         ← 에이전트/MCP 템플릿 상수 모음 (watch.py가 import)
+│   ├── watch.py                   ← 메인 진입점 (Git 감시 루프, 설정, 프로세스 관리)
+│   ├── common.py                  ← 공용 상수, 로깅, HTTP 유틸, LLM 호출
+│   ├── setup.py                   ← 프로젝트 초기화/머지, CLAUDE.md 관리
+│   ├── context.py                 ← 컨텍스트 MD 생성, 벡터 인덱싱, 코드 리뷰
+│   ├── domain.py                  ← 도메인 자동 승급, 건강도 리포트, 아키텍처 맵
+│   ├── review.py                  ← 에셋 검증 (DataValidation 커맨드렛)
+│   └── agent_templates.py         ← 에이전트/MCP 템플릿 상수 모음
 ├── mcp/
 │   ├── context_search/
 │   │   └── server.py              ← 태그 + 벡터 검색 MCP (ChromaDB)
@@ -145,8 +150,8 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 **초기 컨텍스트 빌드 (`initial_context_build`)**
 - 최초 설치 시 또는 누락분이 있을 때 자동 실행
 - `git ls-files`로 추적 중인 모든 소스 파일을 수집 (`_list_all_source_files`)
-- `_group_by_directory`로 디렉토리(모듈) 단위 그룹핑
-- 이미 컨텍스트 MD가 존재하는 모듈은 건너뜀 (중단 후 재실행 시 누락분만 보충)
+- `_group_files`로 stem(파일명) 단위 그룹핑 (.h/.cpp 쌍이 하나의 MD)
+- 이미 컨텍스트 MD가 존재하는 stem은 건너뜀 (중단 후 재실행 시 누락분만 보충)
 - `_process_directory_group`으로 병렬 LLM 호출 (컨텍스트만, 리뷰 없음)
 - 완료 후 벡터 인덱스 전체 구축 (`update_vector_index` rebuild)
 - 10개 모듈마다 진행률 로그 출력
@@ -155,11 +160,9 @@ AgentWatch.zip  ← 배포 패키지 (build.bat 완료 시 자동 생성)
 - `git fetch` → remote 해시와 local 해시 비교
 - 변경 감지 시: `git pull` → `git diff --name-only` → `process_commit()` 실행
   1. **컨텍스트+리뷰 통합 처리** (`process_commit`) — 변경 파일을 그룹핑 후 **1회의 LLM 호출**로 컨텍스트 MD 생성 + 코드 리뷰를 동시 수행 (병렬 6워커)
-     - **적응형 그룹핑** (`_group_files`): 디렉토리 단위로 묶되, 합산 크기가 `GROUP_CONTENT_LIMIT`(8000자) 초과 시 파일명(stem) 단위로 분할
-     - 소규모 디렉토리: 전체를 하나의 MD로 합침 (예: `Mission.md`)
-     - 대규모 디렉토리: 같은 이름의 `.h`/`.cpp`만 묶어 별도 MD (예: `TaskSystem.md`, `MissionManager.md`)
+     - **stem 단위 그룹핑** (`_group_files`): 항상 파일명(stem) 단위로 그룹핑하여 `.h`/`.cpp` 쌍을 하나의 MD로 생성 (예: `DamageSystem.h` + `DamageSystem.cpp` → `Combat/DamageSystem.md`)
+     - 변경되지 않은 파일의 MD를 덮어쓰지 않음 — 각 stem이 독립적인 MD를 가짐
      - `.h`를 먼저, `.cpp`를 뒤에 배치하여 인터페이스→구현 순서로 분석
-     - 그룹당 최대 8000자 (`GROUP_CONTENT_LIMIT`)
      - `auto_review: false` 시 컨텍스트 MD만 생성
      - LLM 응답을 `=== CONTEXT_MD ===` / `=== CODE_REVIEW ===` 구분자로 파싱하여 분리 저장
   2. **벡터 인덱싱** (`update_vector_index`) — 생성된 MD를 ChromaDB에 upsert → `vector_db/`
