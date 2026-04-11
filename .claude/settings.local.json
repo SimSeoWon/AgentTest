@@ -47,7 +47,9 @@
       "Bash(py:*)",
       "Bash(C:/Users/USER/AppData/Local/Programs/Python/Python312/python.exe:*)",
       "Bash(/c/Users/USER/AppData/Local/Programs/Python/Python312/python.exe:*)",
-      "Bash(netsh advfirewall:*)"
+      "Bash(netsh advfirewall:*)",
+      "Bash(ipconfig)",
+      "Bash(gemini --version)"
     ]
   }
 }

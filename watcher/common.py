@@ -104,10 +104,15 @@ def _call_gemini(prompt: str) -> str | None:
     if not shutil.which("gemini"):
         log("[경고] Gemini CLI를 찾을 수 없음")
         return None
-    result = subprocess.run(
-        ["gemini", "-y", prompt],
-        capture_output=True, text=True, encoding='utf-8', errors='replace'
-    )
+    try:
+        result = subprocess.run(
+            ["gemini", "-y"],
+            input=prompt,
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+        )
+    except OSError as e:
+        log(f"[오류] Gemini 실행 실패: {e}")
+        return None
     if result.returncode != 0:
         print(f"[오류] Gemini 호출 실패: {result.stderr[:200]}")
         return None
