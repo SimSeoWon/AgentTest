@@ -327,6 +327,28 @@ def promote_domains(
     # 도메인 3개 이상이면 아키텍처 맵 자동 생성
     _generate_architecture_overview(context_dir, use_gemini)
 
+    # 승급 완료 — 승급에 사용된 문서가 포함된 로그 항목만 제거
+    promoted_docs = set()
+    for cluster in new_clusters:
+        promoted_docs.update(cluster)
+    log_path = base_dir / ".claude" / "search_log.jsonl"
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        kept = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            results = set(entry.get("results", []))
+            if not results & promoted_docs:
+                kept.append(line)
+        removed = len(lines) - len(kept)
+        log_path.write_text("\n".join(kept) + "\n" if kept else "", encoding="utf-8")
+        common.log(f"검색 로그 정리: {removed}건 제거, {len(kept)}건 보존")
+    except Exception:
+        pass
+
     # 도메인 문서 포함하여 벡터 인덱스 재구축
     common.log("도메인 반영 — 벡터 인덱스 갱신 중...")
     update_vector_index(context_dir, base_dir)
