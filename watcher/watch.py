@@ -164,6 +164,37 @@ def find_git_repo(base_dir: Path) -> Path:
 
 
 # ─────────────────────────────────────────
+# 방화벽
+# ─────────────────────────────────────────
+
+def _setup_firewall(port: int):
+    """Windows 방화벽 인바운드 규칙을 확인하고 없으면 추가한다."""
+    rule_name = f"AgentWatch Context Server (TCP {port})"
+    # 기존 규칙 확인
+    check = subprocess.run(
+        ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+    )
+    if check.returncode == 0 and rule_name in check.stdout:
+        print(f"  방화벽 규칙이 이미 존재합니다: {rule_name}")
+        return
+
+    # 관리자 권한으로 규칙 추가
+    print(f"  방화벽 규칙 추가 중... (관리자 권한 필요)")
+    result = subprocess.run(
+        ["netsh", "advfirewall", "firewall", "add", "rule",
+         f"name={rule_name}", "dir=in", "action=allow",
+         "protocol=TCP", f"localport={port}"],
+        capture_output=True, text=True, encoding='utf-8', errors='replace',
+    )
+    if result.returncode == 0:
+        print(f"  방화벽 인바운드 규칙 추가 완료 (포트 {port})")
+    else:
+        print(f"  [경고] 방화벽 설정 실패 — 관리자 권한으로 watch.exe를 실행해주세요.")
+        print(f"  수동 설정: netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=TCP localport={port}")
+
+
+# ─────────────────────────────────────────
 # 설정
 # ─────────────────────────────────────────
 
@@ -223,6 +254,11 @@ def load_or_init_config(base_dir: Path, repo_dir: Path) -> dict:
     if server_mode:
         port_raw = input("HTTP 서버 포트 (기본값: 8100): ").strip()
         server_port = int(port_raw) if port_raw.isdigit() else 8100
+        # 방화벽 인바운드 규칙 설정
+        if sys.platform == 'win32':
+            fw_raw = input(f"방화벽 인바운드 포트 {server_port} 설정을 확인해보시겠습니까? (y/n): ").strip().lower()
+            if fw_raw == 'y':
+                _setup_firewall(server_port)
     else:
         url_raw = input("원격 RAG 서버 URL (없으면 Enter, 예: http://192.168.1.100:8100): ").strip()
         context_server_url = url_raw

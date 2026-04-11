@@ -46,7 +46,8 @@
       "Bash(py -3 -c \"import ast; ast.parse\\(open\\(''mcp/context_search/server.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(py:*)",
       "Bash(C:/Users/USER/AppData/Local/Programs/Python/Python312/python.exe:*)",
-      "Bash(/c/Users/USER/AppData/Local/Programs/Python/Python312/python.exe:*)"
+      "Bash(/c/Users/USER/AppData/Local/Programs/Python/Python312/python.exe:*)",
+      "Bash(netsh advfirewall:*)"
     ]
   }
 }
