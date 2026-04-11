@@ -454,6 +454,9 @@ def combined_search(query: str, project_root: str = ".", tags: list[str] | None 
         key=lambda x: (source_order.get(x["source"], 9), -x.get("similarity", 0)),
     )
 
+    # n_results로 최종 결과 수 제한
+    sorted_results = sorted_results[:n_results]
+
     # 검색 로그 기록 (도메인 자동 승급용)
     _log_search(project_root, [r["file"] for r in sorted_results])
 
@@ -1040,6 +1043,8 @@ def _run_http_server(project_root: str, port: int = 8100, host: str = "0.0.0.0")
             merged.values(),
             key=lambda x: (source_order.get(x["source"], 9), -x.get("similarity", 0)),
         )
+        # n_results로 최종 결과 수 제한
+        sorted_results = sorted_results[:req.n_results]
         # 검색 로그 기록
         _log_search(project_root, [r["file"] for r in sorted_results])
 
